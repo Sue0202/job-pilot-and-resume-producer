@@ -1,0 +1,22 @@
+# Raw external dataset (large / private) — keep local, never commit
+data/raw/
+
+# Databases (runtime)
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs / archives / env
+*.zip
+*.log
+.env
+
+# OS
+.DS_Store
+
+# NOTE: data/processed/*.csv is intentionally NOT ignored so the app's
+# processed job datasets are committed.
