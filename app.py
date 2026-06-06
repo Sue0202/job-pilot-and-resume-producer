@@ -15,10 +15,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import analytics
 import database as db
 import docx_export
 import matching
 import resume_generator as rg
+import test_personas
 
 BASE_DIR = Path(__file__).parent
 PROFILE_PATH = BASE_DIR / "candidate_master_profile.md"
@@ -111,6 +113,15 @@ def load_readme():
     if README_PATH.exists():
         return README_PATH.read_text(encoding="utf-8")
     return "# JobPilot\n\nREADME.md not found. See project documentation."
+
+
+# Dense embeddings are expensive; build once per dataset and cache the index as a
+# resource. Returns None if the dense backend is unavailable (graceful fallback).
+@st.cache_resource(show_spinner="Building dense embeddings (first time only)...")
+def _get_dense_index(dataset_label, n_rows):
+    jobs, _ = load_jobs()
+    # Cap dense indexing to the interactive 3K dataset size for responsiveness.
+    return matching.build_embedding_index(jobs, max_rows=3000)
 
 
 # ---------------------------------------------------------------------------
@@ -292,15 +303,38 @@ def page_job_matching():
         filtered = filtered[filtered["role_family"].isin(selected_families)]
 
     st.caption(f"{len(filtered)} jobs match the current filters (ranking up to {RANK_CAP}).")
-    top_n = st.slider("Number of recommendations to show", 5, 50, 25)
+
+    cm1, cm2 = st.columns([2, 1])
+    with cm1:
+        method_label = st.selectbox(
+            "Ranking method",
+            ["TF-IDF baseline", "Dense embedding retrieval", "Hybrid ranking"],
+        )
+    with cm2:
+        top_n = st.slider("Recommendations", 5, 50, 25)
+    method = {
+        "TF-IDF baseline": "tfidf",
+        "Dense embedding retrieval": "dense",
+        "Hybrid ranking": "hybrid",
+    }[method_label]
 
     if st.button("Recommend Jobs", type="primary"):
         feedback_rows = db.get_job_feedback()
+        dense_index = None
+        if method in ("dense", "hybrid"):
+            dense_index = _get_dense_index(dataset_label, len(jobs))
+            if dense_index is None:
+                st.warning(
+                    "Dense embeddings unavailable (sentence-transformers not installed "
+                    "or model download failed). Falling back to TF-IDF baseline."
+                )
         ranked = matching.rank_jobs(
             profile_text,
             filtered.head(RANK_CAP).to_dict("records"),
             feedback_rows=feedback_rows,
             top_n=top_n,
+            method=method,
+            dense_index=dense_index,
         )
         st.session_state["ranked_jobs"] = ranked
 
@@ -309,14 +343,20 @@ def page_job_matching():
         st.info("Set filters and click **Recommend Jobs** to see ranked recommendations.")
         return
 
-    # ---- 2. Recommendations table ----------------------------------------
+    # ---- 2. Recommendations table (with explain columns) -----------------
     st.divider()
+    method_used = ranked[0].get("method_used", "tfidf")
     st.subheader("2. Top Recommended Jobs")
+    st.caption(f"Ranking method used: **{method_used}**")
     table = pd.DataFrame(
         [
             {
                 "rank": r["rank"],
                 "match_score": r["match_score"],
+                "dense_score": r.get("dense_score") if r.get("dense_score") is not None else "",
+                "tfidf_score": r.get("tfidf_score", ""),
+                "coverage_score": r.get("coverage_score", ""),
+                "feedback_adj": r.get("feedback_adjustment", 0.0),
                 "role_family": r["role_family"],
                 "company": r["job_row"].get("company", ""),
                 "job_title": r["job_row"].get("job_title", ""),
@@ -329,12 +369,27 @@ def page_job_matching():
         ]
     )
     st.dataframe(table, width="stretch", hide_index=True)
+    st.caption(
+        "Explain: match_score blends dense (when available), TF-IDF, and keyword "
+        "coverage, plus a feedback adjustment."
+    )
     st.download_button(
         "Download Top Jobs as CSV",
         data=table.to_csv(index=False).encode("utf-8"),
         file_name="top_recommended_jobs.csv",
         mime="text/csv",
     )
+
+    with st.expander("Benchmark ranking methods (TF-IDF vs Dense vs Hybrid)"):
+        st.caption("Runs all three methods on a sample of the filtered jobs.")
+        if st.button("Run Benchmark"):
+            dense_index = _get_dense_index(dataset_label, len(jobs))
+            bench = matching.evaluate_ranking_methods(
+                profile_text, filtered.head(400), sample_rows=400, dense_index=dense_index
+            )
+            st.json(bench)
+            if not bench.get("dense_available"):
+                st.info("Dense backend unavailable — dense/hybrid rows reflect TF-IDF fallback.")
 
     # ---- 3. Select one recommended job -----------------------------------
     st.divider()
@@ -572,6 +627,159 @@ def page_application_tracker():
             _flash("Record updated.")
 
 
+def page_batch_analytics():
+    st.header("Batch Analytics")
+    jobs, dataset_label = load_jobs()
+    st.caption(f"Dataset: **{dataset_label}** — {len(jobs)} jobs")
+    if jobs.empty:
+        st.warning("No job dataset found. Run `python3 preprocess_jobs.py` first.")
+        return
+
+    stats = analytics.compute_batch_analytics(jobs)
+
+    st.metric("Total Jobs Loaded", stats["total_jobs"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Jobs by Role Family")
+        st.bar_chart(stats["by_role_family"])
+    with c2:
+        st.subheader("Source Distribution (top 20)")
+        st.bar_chart(stats["source_distribution"])
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.subheader("Top 20 Locations")
+        st.bar_chart(stats["top_locations"])
+    with c4:
+        st.subheader("Top 20 Companies")
+        st.bar_chart(stats["top_companies"])
+
+    st.subheader("Top Keyword / Skill Demand (in descriptions)")
+    st.bar_chart(stats["keyword_frequencies"])
+
+    if len(stats["employment_type_distribution"]) > 0:
+        st.subheader("Employment Type Distribution")
+        st.bar_chart(stats["employment_type_distribution"])
+
+    st.subheader("Missing Data Audit")
+    miss = stats["missing"]
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Missing salary %", f"{miss['salary_pct']}%")
+    mc2.metric("Missing job_url %", f"{miss['job_url_pct']}%")
+    mc3.metric("Missing location %", f"{miss['location_pct']}%")
+
+    if stats["salary_summary"]:
+        st.subheader("Salary Summary (parseable values only)")
+        st.json(stats["salary_summary"])
+    else:
+        st.caption("No parseable salary data available in this dataset.")
+
+    summary_df = analytics.analytics_to_csv(stats)
+    st.download_button(
+        "Download Analytics Summary as CSV",
+        data=summary_df.to_csv(index=False).encode("utf-8"),
+        file_name="batch_analytics_summary.csv",
+        mime="text/csv",
+    )
+
+
+def page_test_personas():
+    st.header("Test Personas")
+    st.caption(
+        "Evaluates recommendation quality for the four official personas. "
+        "These personas are for ranking evaluation only and do NOT use the project "
+        "owner's real resume material."
+    )
+
+    jobs, dataset_label = load_jobs()
+    if jobs.empty:
+        st.warning("No job dataset found. Run `python3 preprocess_jobs.py` first.")
+        return
+
+    keys = list(test_personas.PERSONAS.keys())
+    persona_key = st.selectbox(
+        "Select persona",
+        keys,
+        format_func=lambda k: test_personas.PERSONAS[k]["persona_name"],
+    )
+    persona = test_personas.PERSONAS[persona_key]
+
+    with st.expander("Persona details"):
+        st.write(f"**Background:** {persona['background']}")
+        st.write(f"**Skills:** {', '.join(persona['skills'])}")
+        st.write(f"**Target roles:** {', '.join(persona['target_roles'])}")
+        st.write(f"**Dealbreakers:** {', '.join(persona['dealbreakers'])}")
+        st.write(f"**Pass criteria:** {persona['pass_criteria']}")
+
+    if st.button("Run Ranking & Evaluate", type="primary"):
+        # Rank using ONLY the persona profile text (no candidate facts injected).
+        ranked = matching.rank_jobs(
+            persona["profile_text"],
+            jobs.head(RANK_CAP).to_dict("records"),
+            feedback_rows=None,
+            top_n=10,
+            method="tfidf",
+            include_candidate_facts=False,
+        )
+        st.session_state["persona_ranked"] = ranked
+        st.session_state["persona_key_eval"] = persona_key
+
+    ranked = st.session_state.get("persona_ranked")
+    if not ranked or st.session_state.get("persona_key_eval") != persona_key:
+        st.info("Click **Run Ranking & Evaluate** to score this persona against the jobs.")
+        return
+
+    st.subheader("Top 10 Recommended Jobs")
+    top_table = pd.DataFrame(
+        [
+            {
+                "rank": r["rank"],
+                "match_score": r["match_score"],
+                "role_family": r["role_family"],
+                "company": r["job_row"].get("company", ""),
+                "job_title": r["job_row"].get("job_title", ""),
+                "location": r["job_row"].get("location", ""),
+            }
+            for r in ranked
+        ]
+    )
+    st.dataframe(top_table, width="stretch", hide_index=True)
+
+    top_jobs = [r["job_row"] for r in ranked]
+    checks = test_personas.evaluate_persona(persona_key, top_jobs)
+    checks_df = pd.DataFrame(checks)
+    st.subheader("Pass / Fail Evaluation")
+    st.dataframe(checks_df, width="stretch", hide_index=True)
+
+    n_pass = sum(1 for c in checks if c["result"] == "Pass")
+    st.caption(
+        f"{n_pass}/{len(checks)} checks passed. Limitation: the dataset is a generic "
+        "ops/analytics snapshot, so some persona-specific roles may be under-represented."
+    )
+
+    export_df = checks_df.copy()
+    export_df.insert(0, "persona", persona["persona_name"])
+    st.download_button(
+        "Download Persona Evaluation CSV",
+        data=export_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"persona_evaluation_{persona_key}.csv",
+        mime="text/csv",
+    )
+
+    with st.expander("Optional: generic persona demo resume (NOT the project owner's resume)"):
+        st.caption(
+            "For demonstration only. This is a synthetic generic resume and never uses "
+            "Yeyi Su's verified resume material."
+        )
+        if st.checkbox("Show persona demo resume"):
+            st.text_area(
+                "Persona demo resume",
+                value=test_personas.build_persona_demo_resume(persona_key),
+                height=300,
+            )
+
+
 def page_readme():
     st.header("Project README")
     st.markdown(load_readme())
@@ -594,6 +802,8 @@ def main():
             "Job Matching",
             "Generated Versions",
             "Application Tracker",
+            "Batch Analytics",
+            "Test Personas",
             "Project README",
         ],
     )
@@ -606,6 +816,10 @@ def main():
         page_generated_versions()
     elif page == "Application Tracker":
         page_application_tracker()
+    elif page == "Batch Analytics":
+        page_batch_analytics()
+    elif page == "Test Personas":
+        page_test_personas()
     elif page == "Project README":
         page_readme()
 

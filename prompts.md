@@ -161,6 +161,38 @@ the code as features were added across iterations.
 
 ---
 
+## 9. Weakness Improvement Prompt
+
+**Purpose:** This prompt added dense-vector retrieval fallback, stream-style ingestion
+documentation, batch analytics, and persona evaluation while preserving the project
+owner's verified resume generator.
+
+**Prompt (condensed):**
+> Improve grading weaknesses without breaking the working MVP. (1) Add true dense
+> embeddings / ANN-style retrieval using `sentence-transformers/all-MiniLM-L6-v2`,
+> keeping TF-IDF as a graceful fallback; add `build_embedding_index`, `rank_jobs_dense`,
+> a ranking-method selector (TF-IDF / Dense / Hybrid), a hybrid score
+> (`0.50*dense + 0.30*tfidf + 0.20*coverage + feedback_bias`), a per-job explain view,
+> and an `evaluate_ranking_methods` benchmark. (2) Better justify streaming: process the
+> raw JSON incrementally in batches, log progress every 5,000 records, deduplicate with
+> running sets, and add `simulate_streaming_ingestion`; document it as stream-style batch
+> ingestion (not real-time). (3) Add a Batch Analytics page (`compute_batch_analytics`).
+> (4) Add four official test personas for ranking evaluation only, never reusing the
+> real resume material.
+
+**How AI was used:**
+- Implemented the optional dense backend with a lazy singleton model loader and
+  try/except guards so the app falls back to TF-IDF (with a UI warning) whenever
+  `sentence-transformers` is missing or the model cannot be downloaded.
+- Cached embeddings via `st.cache_resource` and capped dense indexing to the ~3K app
+  dataset for interactive responsiveness.
+- Added per-component (dense / TF-IDF / coverage / feedback) scores to each result for
+  the explain view, plus a benchmark expander.
+- Refactored `rank_jobs` with an `include_candidate_facts` flag so persona ranking uses
+  only the persona profile text and never injects the owner's verified facts.
+
+---
+
 ## Appendix — Build Iterations (summary)
 
 1. **Round 1:** initial MVP (sections 1–2 above, plus matching and DOCX/TXT export).
@@ -169,3 +201,6 @@ the code as features were added across iterations.
 3. **Round 3:** external dataset preprocessing, ranked recommendations, and
    feedback-based ranking (sections 5–7).
 4. **Docs:** README/brief drafting kept current throughout (section 8).
+5. **Round 4 (weakness improvement):** dense/hybrid ranking with TF-IDF fallback,
+   stream-style ingestion documentation, batch analytics, and persona evaluation
+   (section 9).

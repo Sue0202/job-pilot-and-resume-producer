@@ -2,3 +2,6 @@ streamlit
 pandas
 scikit-learn
 python-docx
+# Optional: enables dense-embedding / hybrid ranking. The app falls back to
+# TF-IDF automatically if this is not installed or the model cannot be downloaded.
+sentence-transformers

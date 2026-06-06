@@ -4,8 +4,10 @@ Reads the raw MongoDB-style JSON array (data/raw/job_raw.json) ONCE, extracts an
 normalizes useful fields, filters to relevant job families, removes duplicates, and
 writes two smaller CSVs the Streamlit app can load cheaply:
 
-    data/processed/external_jobs_sample.csv   (up to TARGET_ROWS relevant jobs)
-    data/processed/external_jobs_demo_200.csv (up to 200 rows for fast testing)
+    data/processed/external_jobs_sample.csv     (up to TARGET_ROWS relevant jobs)
+    data/processed/external_jobs_demo_200.csv   (up to 200 rows for fast testing)
+    data/processed/external_jobs_20k_sample.csv (up to 20,000 structured jobs, not
+                                                 relevance-filtered — submission sample)
 
 The raw file is ~1.3 GB. It is a JSON array with one complete record per physical
 line, so we stream it line-by-line with the standard library `json` module — the
@@ -31,11 +33,14 @@ RAW_PATH = BASE_DIR / "data" / "raw" / "job_raw.json"
 PROCESSED_DIR = BASE_DIR / "data" / "processed"
 SAMPLE_PATH = PROCESSED_DIR / "external_jobs_sample.csv"
 DEMO_PATH = PROCESSED_DIR / "external_jobs_demo_200.csv"
+LARGE_PATH = PROCESSED_DIR / "external_jobs_20k_sample.csv"
 
 TARGET_ROWS = int(os.environ.get("JOBPILOT_TARGET", "3000"))
 DEMO_ROWS = 200
+# Larger, general (not relevance-filtered) structured sample for submission evidence.
+GENERAL_TARGET = int(os.environ.get("JOBPILOT_GENERAL_TARGET", "20000"))
 MAX_SCAN = int(os.environ.get("JOBPILOT_MAX_SCAN", "0")) or None  # None = unlimited
-PROGRESS_EVERY = 50000
+PROGRESS_EVERY = 5000
 DESCRIPTION_MAX_CHARS = 2000
 
 CSV_COLUMNS = [
@@ -255,6 +260,86 @@ def write_csv(path, rows):
             writer.writerow(r)
 
 
+def simulate_streaming_ingestion(input_path, output_path, batch_size=5000, max_records=None):
+    """Stream-style batch ingestion over the large external JSON snapshot.
+
+    Reads records incrementally (never loading the whole file), processes them in
+    fixed-size batches, normalizes and deduplicates each batch, and appends valid
+    rows to the output CSV as it goes. This simulates a streaming-style pipeline
+    suitable for MVP constraints; it is NOT real-time production streaming.
+
+    Returns a summary dict: raw_records, valid_records, duplicates_removed,
+    rows_written.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    seen_ids = set()
+    seen_urls = set()
+    raw_records = 0
+    valid_records = 0
+    duplicates = 0
+    rows_written = 0
+
+    def _process_batch(batch, writer):
+        nonlocal valid_records, duplicates, rows_written
+        for rec in batch:
+            try:
+                row = extract_record(rec, raw_records)
+            except Exception:
+                continue
+            if not row["job_title"] or not row["description"]:
+                continue
+            if row["job_id"] in seen_ids:
+                duplicates += 1
+                continue
+            if row["job_url"] and row["job_url"] in seen_urls:
+                duplicates += 1
+                continue
+            seen_ids.add(row["job_id"])
+            if row["job_url"]:
+                seen_urls.add(row["job_url"])
+            row["role_family"] = classify_and_filter(row) or "Other"
+            valid_records += 1
+            writer.writerow(row)
+            rows_written += 1
+
+    print(f"Stream-style batch ingestion: {input_path} -> {output_path} (batch={batch_size})")
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        batch = []
+        for rec in iter_raw_records(input_path):
+            raw_records += 1
+            if max_records and raw_records > max_records:
+                raw_records -= 1
+                break
+            batch.append(rec)
+            if len(batch) >= batch_size:
+                _process_batch(batch, writer)
+                batch = []
+                print(
+                    f"  batch flushed | raw={raw_records:,} valid={valid_records:,} "
+                    f"dups={duplicates:,} written={rows_written:,}"
+                )
+        if batch:
+            _process_batch(batch, writer)
+
+    summary = {
+        "raw_records": raw_records,
+        "valid_records": valid_records,
+        "duplicates_removed": duplicates,
+        "rows_written": rows_written,
+        "output_path": str(output_path),
+    }
+    print(
+        f"\nStreaming summary: raw={raw_records:,} valid={valid_records:,} "
+        f"duplicates={duplicates:,} written={rows_written:,} -> {output_path}"
+    )
+    return summary
+
+
 def main():
     if not RAW_PATH.exists():
         print(f"ERROR: raw file not found at {RAW_PATH}")
@@ -262,9 +347,17 @@ def main():
         sys.exit(1)
 
     print(f"Reading raw dataset: {RAW_PATH}")
-    print(f"Target relevant rows: {TARGET_ROWS}" + (f" | max scan: {MAX_SCAN}" if MAX_SCAN else ""))
+    print(
+        f"Targets: relevant={TARGET_ROWS} general(20k sample)={GENERAL_TARGET}"
+        + (f" | max scan: {MAX_SCAN}" if MAX_SCAN else "")
+    )
 
-    kept = []
+    # `general` holds up to GENERAL_TARGET valid structured jobs (any role_family,
+    # including 'Other'). `relevant` is the subset passing the relevance filter,
+    # capped at TARGET_ROWS and used by the app. Dedupe is shared so a unique job
+    # appears at most once in each file.
+    general = []
+    relevant = []
     seen_ids = set()
     seen_urls = set()
     scanned = 0
@@ -276,7 +369,7 @@ def main():
         if MAX_SCAN and scanned > MAX_SCAN:
             break
         if scanned % PROGRESS_EVERY == 0:
-            print(f"  scanned {scanned:,} records | kept {len(kept):,}")
+            print(f"  scanned {scanned:,} | general {len(general):,} | relevant {len(relevant):,}")
 
         try:
             row = extract_record(rec, scanned)
@@ -287,11 +380,6 @@ def main():
         if not row["job_title"] or not row["description"]:
             skipped_missing += 1
             continue
-
-        family = classify_and_filter(row)
-        if not family:
-            continue
-        row["role_family"] = family
 
         # Dedupe by job_id, then by job_url.
         if row["job_id"] in seen_ids:
@@ -304,34 +392,60 @@ def main():
         if row["job_url"]:
             seen_urls.add(row["job_url"])
 
-        kept.append(row)
-        if len(kept) >= TARGET_ROWS:
-            print(f"  reached target of {TARGET_ROWS} relevant rows; stopping scan.")
+        # Classify role_family for everything; relevance is whether it matched a group.
+        family = classify_and_filter(row)
+        row["role_family"] = family or "Other"
+
+        if len(general) < GENERAL_TARGET:
+            general.append(row)
+        if family and len(relevant) < TARGET_ROWS:
+            relevant.append(row)
+
+        # Stop once both targets are satisfied.
+        if len(general) >= GENERAL_TARGET and len(relevant) >= TARGET_ROWS:
+            print(f"  reached both targets; stopping scan.")
             break
 
     print(
-        f"\nDone scanning. scanned={scanned:,} kept={len(kept):,} "
-        f"skipped_missing={skipped_missing:,} duplicates={duplicates:,}"
+        f"\nDone scanning. scanned={scanned:,} general={len(general):,} "
+        f"relevant={len(relevant):,} skipped_missing={skipped_missing:,} "
+        f"duplicates={duplicates:,}"
     )
 
-    if not kept:
-        print("WARNING: no relevant rows found. Writing headers only.")
+    if not relevant:
+        print("WARNING: no relevant rows found. Writing relevant headers only.")
 
-    write_csv(SAMPLE_PATH, kept)
-    write_csv(DEMO_PATH, kept[:DEMO_ROWS])
+    write_csv(SAMPLE_PATH, relevant)
+    write_csv(DEMO_PATH, relevant[:DEMO_ROWS])
+    write_csv(LARGE_PATH, general)
 
-    print(f"Wrote {len(kept):,} rows -> {SAMPLE_PATH}")
-    print(f"Wrote {min(len(kept), DEMO_ROWS):,} rows -> {DEMO_PATH}")
+    print(f"Wrote {len(relevant):,} rows -> {SAMPLE_PATH}")
+    print(f"Wrote {min(len(relevant), DEMO_ROWS):,} rows -> {DEMO_PATH}")
+    print(f"Wrote {len(general):,} rows -> {LARGE_PATH}")
 
-    # Small role_family distribution summary.
-    dist = {}
-    for r in kept:
-        dist[r["role_family"]] = dist.get(r["role_family"], 0) + 1
-    if dist:
-        print("\nRole family distribution:")
-        for fam, n in sorted(dist.items(), key=lambda x: -x[1]):
-            print(f"  {fam}: {n}")
+    def _print_dist(label, rows):
+        dist = {}
+        for r in rows:
+            dist[r["role_family"]] = dist.get(r["role_family"], 0) + 1
+        if dist:
+            print(f"\nRole family distribution ({label}):")
+            for fam, n in sorted(dist.items(), key=lambda x: -x[1]):
+                print(f"  {fam}: {n}")
+
+    _print_dist("relevant app dataset", relevant)
+    _print_dist("20k general sample", general)
 
 
 if __name__ == "__main__":
-    main()
+    # `python3 preprocess_jobs.py` builds the processed datasets.
+    # `python3 preprocess_jobs.py stream` runs the stream-style batch ingestion demo.
+    if len(sys.argv) > 1 and sys.argv[1] == "stream":
+        demo_max = int(os.environ.get("JOBPILOT_STREAM_MAX", "20000"))
+        simulate_streaming_ingestion(
+            RAW_PATH,
+            PROCESSED_DIR / "stream_ingestion_output.csv",
+            batch_size=5000,
+            max_records=demo_max,
+        )
+    else:
+        main()
