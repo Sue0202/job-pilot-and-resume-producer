@@ -21,3 +21,4 @@ venv/
 # NOTE: data/processed/*.csv is intentionally NOT ignored so the app's
 # processed job datasets are committed.
 .Rhistory
+brief.pdf
