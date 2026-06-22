@@ -222,5 +222,5 @@ recommendation quality and filtering behavior.
 
 ## 8. Links
 
-- **Deployment URL:** _<add Streamlit Community Cloud URL here>_
-- **GitHub URL:** _<add GitHub repository URL here>_
+- **Deployment URL:** https://job-pilot-and-resume-tailor.streamlit.app/
+- **GitHub URL:** https://github.com/Sue0202/job-pilot-and-resume-producer
