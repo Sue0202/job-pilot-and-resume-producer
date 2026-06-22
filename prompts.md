@@ -269,6 +269,18 @@ re-analysis.
 > unchanged. Implemented as UI helpers (`_classify_evidence_quality`,
 > `_newly_covered_skills`) in `app.py` without touching the scoring model.
 
+**Follow-up — better angle + 4-level evidence quality:**
+> Two fixes (no scoring-weight changes): (1) for business-systems / enterprise-tooling JDs
+> (Salesforce, Workday, NetSuite, integrations, internal tools, process improvement),
+> suggest a Business Systems / Internal Tools angle instead of defaulting to Customer
+> Support unless the JD is explicitly support/CX. (2) Expand temporary evidence quality to
+> four levels (Skill claim only / Basic / Concrete / Outcome-backed) with scaled effects —
+> skill/basic raise Skill Fit only, concrete adds a small Experience Fit bump, outcome-backed
+> adds more, and Resume Evidence Strength is never auto-raised. Implemented `_suggested_angle`
+> and `classify_evidence_quality` in `jd_analyzer.py` plus an optional `added_evidence_quality`
+> Experience-Fit bonus used only during re-analysis; updated the "Why changed" explanation and
+> added unit tests for all four categories and the angle behavior.
+
 **Base vs. calibrated vs. re-analysis (key distinction):**
 - **Base Fit Score** = the model's conservative rule-based score for the JD as written.
 - **Calibrated Score** = Base ± a user adjustment from Score Calibration Feedback; saved

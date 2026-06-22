@@ -46,11 +46,20 @@ job-search copilot.
        **before/after** comparison. Results separate **(A) new JD requirements covered by
        the added evidence** (e.g. Salesforce, Tableau, Looker) from **(B) new verified
        evidence items matched** (which can stay 0 for a short unverified note), tag the
-       added text with an **evidence-quality label** (Skill claim only / Concrete
-       experience example / Outcome-backed experience example), and explain **why** each
-       component changed. A skill claim only can raise Skill Fit but not Experience Fit or
-       Resume Evidence Strength. It never edits `candidate_master_profile.md`; "Save This
-       Evidence to Evidence Library" is a clearly-labeled placeholder that saves nothing yet.
+       added text with a four-level **evidence-quality label** (Skill claim only / Basic /
+       Concrete / Outcome-backed experience example), and explain **why** each component
+       changed. Effects scale with quality: skill-claim-only and basic examples raise Skill
+       Fit but not Experience Fit or Resume Evidence Strength; a concrete example allows a
+       small Experience Fit increase; an outcome-backed example raises it more. Resume
+       Evidence Strength and the "new verified evidence items matched" count are **never**
+       auto-raised by temporary text — it never edits `candidate_master_profile.md`, and
+       "Save This Evidence to Evidence Library" is a clearly-labeled placeholder that saves
+       nothing yet.
+  - **Smarter suggested resume angle:** JDs about business systems, enterprise tooling,
+    integrations, internal tools, process improvement, Salesforce/Workday/NetSuite, or
+    cross-functional systems are positioned as *Product Operations & Business Systems /
+    Business Systems – Operations Analyst / Internal Tools & Process Improvement* rather
+    than defaulting to a Customer Support angle (reserved for explicitly support/CX JDs).
   - **Transparent role-family calibration:** when prior calibration feedback exists for the
     same role family, a small, visible adjustment (max ±0.3) is shown (e.g. "Calibration
     adjustment from prior feedback: +0.2") with the resulting adjusted score.

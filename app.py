@@ -259,27 +259,20 @@ EVIDENCE_TYPES = [
     "Platform Operations", "Creator Operations", "Other",
 ]
 
-# Cues for classifying the *quality* of temporary added evidence.
-_OUTCOME_CUES = ["%", " percent", "increase", "increased", "reduce", "reduced", "grew",
-                 "growth", "improved", "improvement", "resulting in", "led to", "drove",
-                 "saved", "boosted", "x faster", "roi", "revenue", "retention", "conversion"]
-_EXPERIENCE_CUES = ["i ", "managed", "built", "led ", "owned", "launched", "coordinated",
-                    "developed", "delivered", "ran ", "drove", "implemented", "created",
-                    "designed", "responsible for", "at ", "for ", "team", "project",
-                    "stakeholder", "cross-functional"]
-
-
-def _classify_evidence_quality(text):
-    """Return a label describing how strong the temporary added evidence is."""
-    low = (text or "").lower()
-    has_number = any(ch.isdigit() for ch in low)
-    has_outcome = any(c in low for c in _OUTCOME_CUES)
-    has_experience = any(c in low for c in _EXPERIENCE_CUES)
-    if has_number and has_outcome and has_experience:
-        return "Outcome-backed experience example"
-    if has_experience and len(low.split()) >= 6:
-        return "Concrete experience example"
-    return "Skill claim only"
+# Human-readable note on what each evidence-quality level can affect.
+EVIDENCE_QUALITY_EFFECT = {
+    "Skill claim only":
+        "increases Skill Fit only (no Experience Fit or Resume Evidence Strength change).",
+    "Basic experience example":
+        "modestly supports Skill Fit; Experience Fit and Resume Evidence Strength are not "
+        "increased (no scope or outcome given).",
+    "Concrete experience example":
+        "supports Skill Fit and allows a small Experience Fit increase; it is still not "
+        "treated as verified master-profile evidence.",
+    "Outcome-backed experience example":
+        "supports Skill Fit and increases Experience Fit more meaningfully; it is still "
+        "not auto-saved to your master profile.",
+}
 
 
 def _newly_covered_skills(result, profile_text, added_text):
@@ -450,16 +443,20 @@ def _render_analysis_results(profile_text, inputs, result):
                 + f"\n\n## Additional evidence (temporary, type: {ev_type})\n"
                 + added
             )
-            new_result = jd_analyzer.analyze_fit(inputs.get("jd_text", ""), combined)
+            quality = jd_analyzer.classify_evidence_quality(added)
+            new_result = jd_analyzer.analyze_fit(
+                inputs.get("jd_text", ""), combined, added_evidence_quality=quality
+            )
             st.session_state["analyze_reanalysis"] = {
                 "added": added, "ev_type": ev_type, "result": new_result,
+                "quality": quality,
             }
 
     reanalysis = st.session_state.get("analyze_reanalysis")
     if reanalysis:
         new_result = reanalysis["result"]
         added_text = reanalysis.get("added", "")
-        quality = _classify_evidence_quality(added_text)
+        quality = reanalysis.get("quality") or jd_analyzer.classify_evidence_quality(added_text)
         newly_covered = _newly_covered_skills(result, profile_text, added_text)
         new_verified = [e for e in new_result["matched_evidence"]
                         if e not in result["matched_evidence"]]
@@ -471,6 +468,7 @@ def _render_analysis_results(profile_text, inputs, result):
                    delta=f"{round(new_result['base_score'] - base_score, 1):+}")
 
         st.markdown(f"**Temporary evidence quality:** {quality}")
+        st.caption("This evidence " + EVIDENCE_QUALITY_EFFECT.get(quality, ""))
 
         oc1, oc2 = st.columns(2)
         with oc1:
@@ -521,16 +519,29 @@ def _render_analysis_results(profile_text, inputs, result):
                 "Added evidence covered " + ", ".join(newly_covered) +
                 ", though overall Skill Fit was already near its ceiling."
             )
-        if after.get("experience_fit", 0) != before.get("experience_fit", 0):
-            reasons.append("Experience Fit changed because the evidence read as a concrete example.")
-        if after.get("resume_evidence_strength", 0) != before.get("resume_evidence_strength", 0):
-            reasons.append("Resume Evidence Strength changed from the added concrete/outcome evidence.")
-        if quality == "Skill claim only":
+        exp_delta = round(after.get("experience_fit", 0) - before.get("experience_fit", 0), 1)
+        if exp_delta > 0:
             reasons.append(
-                "This is a skill claim only, so Experience Fit and Resume Evidence Strength "
-                "were intentionally not increased."
+                f"Experience Fit increased by {exp_delta:+} because the evidence reads as a "
+                f"{quality.lower()}."
             )
-        if abs(new_result["base_score"] - base_score) < 0.05 and not newly_covered:
+        if quality in ("Skill claim only", "Basic experience example"):
+            reasons.append(
+                f"As a {quality.lower()}, it did not raise Experience Fit or Resume Evidence "
+                "Strength — add scope (stakeholders, deliverable, workflow) or a measurable "
+                "outcome to do that."
+            )
+        elif quality == "Concrete experience example":
+            reasons.append(
+                "Resume Evidence Strength was not changed: a concrete example still is not "
+                "verified master-profile evidence until you save it."
+            )
+        elif quality == "Outcome-backed experience example":
+            reasons.append(
+                "Resume Evidence Strength was not auto-changed: even outcome-backed text stays "
+                "temporary until you explicitly save it to the Evidence Library."
+            )
+        if abs(new_result["base_score"] - base_score) < 0.05 and not newly_covered and exp_delta == 0:
             reasons.append("No JD requirement was newly covered, so the score is essentially unchanged.")
         for r in reasons:
             st.markdown(f"- {r}")
