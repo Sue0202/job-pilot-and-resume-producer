@@ -1,15 +1,63 @@
 # JobPilot: AI Resume Tailoring and Application Tracker
 
-JobPilot is a Streamlit MVP that helps a job seeker tailor a resume to a specific
-job description and track applications. It matches sample job postings against a
-candidate master profile, generates a tailored resume using a rule-based engine,
-exports the result to DOCX or TXT, and persists generated versions and manual
-application records in SQLite.
+JobPilot is a Streamlit app that helps a job seeker analyze a job, tailor a resume to
+it, and track applications. It started as the BAX423 Big Data final project and is now
+a **personal job-search copilot**: paste one job description, get a conservative,
+truthful fit diagnosis against your verified profile, then save the job and tailor a
+resume. It also matches/ranks a large processed job dataset, generates a tailored resume
+using a rule-based engine, exports to DOCX or TXT, and persists everything in SQLite.
 
-Built for the BAX423 Big Data final project.
+Built originally for the BAX423 Big Data final project; extended into a personal
+job-search copilot.
+
+- **Live app:** https://job-pilot-and-resume-tailor.streamlit.app/
+- **Source code:** https://github.com/Sue0202/job-pilot-and-resume-producer
 
 ## MVP Features
 
+- **Analyze Job (primary workflow)** — paste **one** job description (with company, title,
+  apply link, and source) and click **Analyze Fit** to get a conservative fit diagnosis:
+  - **Base Fit Score (0–10)**, a **Priority** (High / Medium / Low / Skip), a colored
+    **Decision**, and a **Confidence** label (High / Medium / Low confidence based on how
+    much JD information was extracted and how directly evidence maps).
+  - Recalibrated, stricter decision bands: **≥ 8.5 High Priority**, **7.0–8.4 Apply with
+    Tailoring**, **5.5–6.9 Maybe – Needs More Evidence**, **< 5.5 Skip**.
+  - **Component scores** (weighted): role fit (20%), experience fit (25%), skill fit (15%),
+    seniority fit (15%), industry transferability (10%), **Sponsorship Feasibility** (5%,
+    higher = more feasible for a candidate who needs sponsorship), resume evidence
+    strength (10%).
+  - **Resume Evidence Strength is conservative**: capped at 6.5 with only adjacent
+    evidence, 8.0 with a single/indirect transferable example, and 9.0+ only when multiple
+    **direct** verified examples cover several of the JD's core responsibilities (and
+    bonus for concrete outcomes/metrics).
+  - A one-line **explanation** of the score, e.g. "8.6 = High Priority. Multiple direct
+    examples align with the JD's core responsibilities."
+  - **Direct vs. adjacent matched evidence**, **missing/gaps**, and **red flags**. Hard
+    requirements (no sponsorship, US-citizen/clearance, quota-carrying sales, CPA, heavy
+    SWE/ML, or senior/staff/principal/director far above candidate experience) apply
+    **hard penalties** that cap the score toward Skip.
+  - **Two separate workflows:**
+    1. **Score Calibration Feedback** — "About right / Too low / Too high" + a change
+       magnitude (Slightly 0.3 / Moderately 0.6 / Significantly 1.0) + reason. This stores
+       a **calibrated score** alongside the base score in SQLite; the **base score is never
+       overwritten**. Both are shown.
+    2. **Add Evidence and Re-analyze** — temporarily append evidence (with an optional
+       evidence type) for **this analysis only**, recompute all components, and see a
+       **before/after** comparison. Results separate **(A) new JD requirements covered by
+       the added evidence** (e.g. Salesforce, Tableau, Looker) from **(B) new verified
+       evidence items matched** (which can stay 0 for a short unverified note), tag the
+       added text with an **evidence-quality label** (Skill claim only / Concrete
+       experience example / Outcome-backed experience example), and explain **why** each
+       component changed. A skill claim only can raise Skill Fit but not Experience Fit or
+       Resume Evidence Strength. It never edits `candidate_master_profile.md`; "Save This
+       Evidence to Evidence Library" is a clearly-labeled placeholder that saves nothing yet.
+  - **Transparent role-family calibration:** when prior calibration feedback exists for the
+    same role family, a small, visible adjustment (max ±0.3) is shown (e.g. "Calibration
+    adjustment from prior feedback: +0.2") with the resulting adjusted score.
+  - **Save Job to Tracker** (status "Saved / To Apply", keeping the base score + role
+    family) and **Generate Tailored Resume for This Job** (verified material only).
+  The JD parser and scorer live in `jd_analyzer.py` and use **no external API**.
+  Scoring/calibration logic is covered by `test_jd_analyzer.py`.
 - **Candidate Profile** — view, edit, save, or upload a Candidate Master Profile
   (resume material library) in markdown.
 - **Job Matching & Recommendations** — load a (preprocessed) external job dataset,
@@ -131,7 +179,12 @@ processed CSVs are missing, the app falls back to `sample_jobs.csv` and still ru
 
 ## Deployment
 
-This app can be deployed for free on **Streamlit Community Cloud**:
+This app is deployed for free on **Streamlit Community Cloud**:
+
+- **Live app:** https://job-pilot-and-resume-tailor.streamlit.app/
+- **GitHub repository:** https://github.com/Sue0202/job-pilot-and-resume-producer
+
+To deploy your own copy:
 
 1. Push this folder to a public GitHub repository.
 2. On Streamlit Community Cloud, create a new app pointing to `app.py`.
@@ -146,7 +199,9 @@ profile edits reset on redeploy. This is acceptable for an MVP demo.
 | --- | --- |
 | `app.py` | Streamlit UI and page routing. |
 | `preprocess_jobs.py` | One-time pipeline: raw JSON → cleaned/filtered processed CSVs. |
-| `database.py` | SQLite layer (resume versions + applications + job feedback). |
+| `database.py` | SQLite layer (resume versions, applications, job feedback, job analyses, score feedback). |
+| `jd_analyzer.py` | One-JD parser + conservative rule-based fit scoring with priority/confidence, evidence-strength caps, and calibration helpers (`parse_jd`, `analyze_fit`, `decision_for`, `priority_for`, `apply_calibration`). |
+| `test_jd_analyzer.py` | Tests for fit scoring bands, hard penalties, added-evidence re-analysis, and score calibration. |
 | `matching.py` | Matching + ranking: keyword bank, role-family rules, TF-IDF, dense embeddings, hybrid ranking, benchmark, feedback bias. |
 | `analytics.py` | Batch analytics helper (`compute_batch_analytics`) over the processed dataset. |
 | `test_personas.py` | Four official test personas + rule-based pass/fail evaluation (ranking only). |

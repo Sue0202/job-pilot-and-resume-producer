@@ -9,6 +9,7 @@ Run locally:
     streamlit run app.py
 """
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import streamlit as st
 import analytics
 import database as db
 import docx_export
+import jd_analyzer
 import matching
 import resume_generator as rg
 import test_personas
@@ -127,6 +129,465 @@ def _get_dense_index(dataset_label, n_rows):
 # ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
+
+SOURCE_OPTIONS = ["LinkedIn", "Company website", "Referral", "Handshake", "Indeed", "Other"]
+
+SCORE_FEEDBACK_REASONS = [
+    "Missed transferable experience",
+    "Overestimated my experience",
+    "Missed a hard requirement",
+    "Weighted tools too heavily",
+    "Weighted industry/domain too heavily",
+    "Ignored sponsorship risk",
+    "Other",
+]
+
+DECISION_STYLE = {
+    "High Priority": ("#0b8043", "🟢"),
+    "Apply with Tailoring": ("#1a73e8", "🔵"),
+    "Maybe - Needs More Evidence": ("#f29900", "🟠"),
+    "Skip": ("#d93025", "🔴"),
+}
+
+
+def _render_decision(decision):
+    color, icon = DECISION_STYLE.get(decision, ("#5f6368", "⚪"))
+    st.markdown(
+        f"<div style='font-size:1.3rem;font-weight:700;color:{color};'>"
+        f"{icon} {decision}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _analysis_to_record(inputs, result):
+    """Flatten an analyze_fit result + inputs into a DB-ready dict."""
+    return {
+        "company": inputs.get("company", ""),
+        "job_title": inputs.get("job_title", ""),
+        "apply_link": inputs.get("apply_link", ""),
+        "source": inputs.get("source", ""),
+        "jd_text": inputs.get("jd_text", ""),
+        "notes": inputs.get("notes", ""),
+        "overall_score": result.get("overall_score", 0.0),
+        "decision": result.get("decision", ""),
+        "selected_role_family": result.get("selected_role_family", ""),
+        "suggested_resume_angle": result.get("suggested_resume_angle", ""),
+        "component_scores_json": json.dumps(result.get("component_scores", {})),
+        "matched_evidence_json": json.dumps(result.get("matched_evidence", [])),
+        "missing_evidence_json": json.dumps(result.get("missing_evidence", [])),
+        "evidence_gap_questions_json": json.dumps(result.get("evidence_gap_questions", [])),
+        "red_flags_json": json.dumps(result.get("red_flags", [])),
+        "recommended_positioning": result.get("recommended_positioning", ""),
+        "scoring_explanation": result.get("scoring_explanation", ""),
+        "added_evidence": inputs.get("added_evidence", ""),
+        "base_score": result.get("base_score", result.get("overall_score", 0.0)),
+        "calibrated_score": result.get("calibrated_score"),
+        "priority": result.get("priority", ""),
+        "confidence": result.get("confidence", ""),
+        "sponsorship_feasibility": result.get("sponsorship_feasibility"),
+        "temporary_added_evidence": inputs.get("added_evidence", ""),
+        "evidence_reanalysis_score": result.get("evidence_reanalysis_score"),
+    }
+
+
+def _persist_current_analysis():
+    """Save the current analysis to job_analyses once; cache id in session."""
+    if st.session_state.get("analyze_analysis_id"):
+        return st.session_state["analyze_analysis_id"]
+    inputs = st.session_state.get("analyze_inputs", {})
+    result = st.session_state.get("analyze_result")
+    if not result:
+        return None
+    record = _analysis_to_record(inputs, result)
+    analysis_id = db.save_job_analysis(record)
+    st.session_state["analyze_analysis_id"] = analysis_id
+    return analysis_id
+
+
+def page_analyze_job():
+    st.header("Analyze Job")
+    st.caption(
+        "Paste one job description, diagnose fit against your verified profile, then "
+        "save it to your tracker or tailor a resume. Your master profile is never "
+        "overwritten by analysis."
+    )
+
+    profile_text = load_profile_text()
+
+    # ---- Intake ----------------------------------------------------------
+    with st.form("analyze_job_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            company = st.text_input("Company", key="aj_company")
+            apply_link = st.text_input("Apply link", key="aj_link")
+        with c2:
+            job_title = st.text_input("Job title", key="aj_title")
+            source = st.selectbox("Source (optional)", SOURCE_OPTIONS, key="aj_source")
+        jd_text = st.text_area("Job description", height=260, key="aj_jd")
+        notes = st.text_input("Notes (optional)", key="aj_notes")
+        analyze_clicked = st.form_submit_button("Analyze Fit", type="primary")
+
+    if analyze_clicked:
+        if not jd_text.strip():
+            st.warning("Please paste a job description first.")
+        else:
+            inputs = {
+                "company": company, "job_title": job_title, "apply_link": apply_link,
+                "source": source, "jd_text": jd_text, "notes": notes, "added_evidence": "",
+            }
+            st.session_state["analyze_inputs"] = inputs
+            st.session_state["analyze_result"] = jd_analyzer.analyze_fit(jd_text, profile_text)
+            # Reset persisted-analysis + handoff state for the new analysis.
+            st.session_state.pop("analyze_analysis_id", None)
+            st.session_state.pop("analyze_show_resume", None)
+            st.session_state.pop("analyze_reanalysis", None)
+            st.session_state.pop("analyze_calibrated", None)
+
+    result = st.session_state.get("analyze_result")
+    inputs = st.session_state.get("analyze_inputs", {})
+    if not result:
+        st.info("Fill in the job description and click **Analyze Fit**.")
+        return
+
+    _render_analysis_results(profile_text, inputs, result)
+
+
+CALIBRATION_MAGNITUDES = {"Slightly: 0.3": 0.3, "Moderately: 0.6": 0.6, "Significantly: 1.0": 1.0}
+
+EVIDENCE_TYPES = [
+    "Launch", "Program Management", "Analytics", "Support Operations",
+    "Platform Operations", "Creator Operations", "Other",
+]
+
+# Cues for classifying the *quality* of temporary added evidence.
+_OUTCOME_CUES = ["%", " percent", "increase", "increased", "reduce", "reduced", "grew",
+                 "growth", "improved", "improvement", "resulting in", "led to", "drove",
+                 "saved", "boosted", "x faster", "roi", "revenue", "retention", "conversion"]
+_EXPERIENCE_CUES = ["i ", "managed", "built", "led ", "owned", "launched", "coordinated",
+                    "developed", "delivered", "ran ", "drove", "implemented", "created",
+                    "designed", "responsible for", "at ", "for ", "team", "project",
+                    "stakeholder", "cross-functional"]
+
+
+def _classify_evidence_quality(text):
+    """Return a label describing how strong the temporary added evidence is."""
+    low = (text or "").lower()
+    has_number = any(ch.isdigit() for ch in low)
+    has_outcome = any(c in low for c in _OUTCOME_CUES)
+    has_experience = any(c in low for c in _EXPERIENCE_CUES)
+    if has_number and has_outcome and has_experience:
+        return "Outcome-backed experience example"
+    if has_experience and len(low.split()) >= 6:
+        return "Concrete experience example"
+    return "Skill claim only"
+
+
+def _newly_covered_skills(result, profile_text, added_text):
+    """JD required/preferred skills newly covered only because of the added text."""
+    parsed = result.get("parsed", {})
+    required = list(parsed.get("required_skills", [])) + list(parsed.get("preferred_skills", []))
+    added_low = (added_text or "").lower()
+    prof_low = (profile_text or "").lower()
+    out = []
+    for s in required:
+        already = s in jd_analyzer.CANDIDATE_SKILLS or s in prof_low
+        if (s in added_low) and not already and s not in out:
+            out.append(s)
+    return out
+
+
+def _component_table(component_scores):
+    weights = jd_analyzer.WEIGHTS
+    label_overrides = {"sponsorship_feasibility": "Sponsorship Feasibility"}
+    return pd.DataFrame(
+        [
+            {
+                "component": label_overrides.get(k, k.replace("_", " ").title()),
+                "score (0-10)": v,
+                "weight": f"{int(weights.get(k, 0) * 100)}%",
+            }
+            for k, v in component_scores.items()
+        ]
+    )
+
+
+def _render_analysis_results(profile_text, inputs, result):
+    st.divider()
+    base_score = result["base_score"]
+    role_family = result["selected_role_family"]
+
+    # Part 4: transparent role-family calibration from prior feedback (max +/- 0.3).
+    rf_adjustment = db.get_calibration_adjustment(role_family)
+    adjusted_score = jd_analyzer.apply_calibration(base_score, rf_adjustment)
+    decision = jd_analyzer.decision_for(adjusted_score)
+    priority = jd_analyzer.priority_for(adjusted_score)
+
+    # ---- 1-2. Headline: base score, priority, decision, confidence -------
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        st.metric("Base Fit Score", f"{base_score} / 10")
+        if rf_adjustment:
+            st.metric("Adjusted Score", f"{adjusted_score} / 10", delta=f"{rf_adjustment:+}")
+    with col_b:
+        _render_decision(decision)
+        st.markdown(
+            f"**Priority:** {priority} &nbsp;|&nbsp; **Confidence:** {result['confidence']}"
+        )
+        st.caption(
+            f"Role family: **{role_family}** | Suggested resume angle: "
+            f"**{result['suggested_resume_angle']}**"
+        )
+    st.info(result["scoring_explanation"])
+    if rf_adjustment:
+        st.caption(
+            f"Previous calibration feedback exists for this role family. "
+            f"Calibration adjustment from prior feedback: {rf_adjustment:+} "
+            f"(base {base_score} -> adjusted {adjusted_score})."
+        )
+
+    # ---- 3. Component score table -----------------------------------------
+    st.subheader("Component Scores")
+    st.dataframe(_component_table(result["component_scores"]), width="stretch", hide_index=True)
+
+    # ---- 4-6. Evidence + red flags ---------------------------------------
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Matched Evidence")
+        if result.get("direct_evidence"):
+            st.caption("Direct (maps to this role family):")
+            for e in result["direct_evidence"]:
+                st.markdown(f"- {e}")
+        if result.get("adjacent_evidence"):
+            st.caption("Adjacent (transferable):")
+            for e in result["adjacent_evidence"]:
+                st.markdown(f"- {e}")
+        if not result.get("matched_evidence"):
+            st.caption("No strong matched evidence detected.")
+    with col2:
+        st.subheader("Missing / Gaps")
+        if result["missing_evidence"]:
+            for e in result["missing_evidence"]:
+                st.markdown(f"- {e}")
+        else:
+            st.caption("No major gaps detected.")
+
+    if result["red_flags"]:
+        st.subheader("Red Flags")
+        for rf in result["red_flags"]:
+            st.markdown(f"- :red[{rf}]")
+
+    # ---- 7. Evidence-gap questions (shown when base < 7.0) ----------------
+    if base_score < 7.0 and result["evidence_gap_questions"]:
+        st.subheader("Evidence needed to make this application stronger")
+        for q in result["evidence_gap_questions"]:
+            st.markdown(f"- {q}")
+
+    # ---- Recommended positioning -----------------------------------------
+    st.subheader("Recommended Resume Positioning")
+    st.markdown(result["recommended_positioning"])
+
+    # ====================================================================
+    # SECTION 1 — Score Calibration Feedback
+    # ====================================================================
+    st.divider()
+    st.subheader("1. Score Calibration Feedback")
+    st.caption("Records your opinion and a calibrated score. The base score is never overwritten.")
+    with st.form("score_feedback_form"):
+        fb_label = st.radio(
+            "Do you agree with this score?",
+            ["About right", "Too low", "Too high"], horizontal=True,
+        )
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            mag_label = st.selectbox("How much should the score change?", list(CALIBRATION_MAGNITUDES))
+        with cc2:
+            fb_reason = st.selectbox("Reason", SCORE_FEEDBACK_REASONS)
+        fb_notes = st.text_input("Notes (optional)")
+        if st.form_submit_button("Save Score Feedback"):
+            magnitude = CALIBRATION_MAGNITUDES[mag_label]
+            sign = {"About right": 0, "Too low": 1, "Too high": -1}[fb_label]
+            signed_adjustment = sign * magnitude
+            calibrated = jd_analyzer.apply_calibration(base_score, signed_adjustment)
+            analysis_id = _persist_current_analysis()
+            db.save_score_feedback(
+                job_analysis_id=analysis_id,
+                feedback_label=fb_label,
+                reason=fb_reason,
+                notes=fb_notes,
+                base_score=base_score,
+                adjustment_magnitude=signed_adjustment,
+                calibrated_score=calibrated,
+                role_family=role_family,
+            )
+            st.session_state["analyze_calibrated"] = (base_score, calibrated)
+            st.success(
+                f"Saved. Base Score {base_score} -> Calibrated Score {calibrated} "
+                f"(adjustment {signed_adjustment:+}). Base score unchanged."
+            )
+    if st.session_state.get("analyze_calibrated"):
+        b, c = st.session_state["analyze_calibrated"]
+        st.caption(f"Most recent calibration — Base: {b} | Calibrated: {c}")
+
+    # ====================================================================
+    # SECTION 2 — Add Evidence and Re-analyze (separate from feedback)
+    # ====================================================================
+    st.divider()
+    st.subheader("2. Add Evidence and Re-analyze")
+    st.caption(
+        "Temporarily appends evidence for THIS analysis only. It does not change your "
+        "master profile or the saved base score."
+    )
+    with st.form("reanalyze_form"):
+        added = st.text_area("Additional related experience / evidence", height=120)
+        ev_type = st.selectbox("Evidence type (optional)", EVIDENCE_TYPES)
+        reanalyze = st.form_submit_button("Re-analyze with Added Evidence")
+    if reanalyze:
+        if not added.strip():
+            st.warning("Add some evidence text first.")
+        else:
+            combined = (
+                profile_text
+                + f"\n\n## Additional evidence (temporary, type: {ev_type})\n"
+                + added
+            )
+            new_result = jd_analyzer.analyze_fit(inputs.get("jd_text", ""), combined)
+            st.session_state["analyze_reanalysis"] = {
+                "added": added, "ev_type": ev_type, "result": new_result,
+            }
+
+    reanalysis = st.session_state.get("analyze_reanalysis")
+    if reanalysis:
+        new_result = reanalysis["result"]
+        added_text = reanalysis.get("added", "")
+        quality = _classify_evidence_quality(added_text)
+        newly_covered = _newly_covered_skills(result, profile_text, added_text)
+        new_verified = [e for e in new_result["matched_evidence"]
+                        if e not in result["matched_evidence"]]
+
+        st.markdown("**Before / After**")
+        bc1, bc2 = st.columns(2)
+        bc1.metric("Base score before", f"{base_score}")
+        bc2.metric("New score after", f"{new_result['base_score']}",
+                   delta=f"{round(new_result['base_score'] - base_score, 1):+}")
+
+        st.markdown(f"**Temporary evidence quality:** {quality}")
+
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            st.markdown("**A. New JD requirements covered by added evidence**")
+            if newly_covered:
+                for s in newly_covered:
+                    st.markdown(f"- {s}")
+            else:
+                st.caption("None — added text did not cover any new JD requirement.")
+        with oc2:
+            st.markdown("**B. New verified evidence items matched**")
+            st.markdown(f"Count: **{len(new_verified)}**")
+            for e in new_verified:
+                st.markdown(f"- {e}")
+
+        st.caption(
+            "Temporary added evidence can improve skill coverage without becoming verified "
+            "resume evidence. It does not automatically increase Experience Fit or Resume "
+            "Evidence Strength unless it includes a concrete, relevant experience example."
+        )
+
+        before = result["component_scores"]
+        after = new_result["component_scores"]
+        delta_df = pd.DataFrame(
+            [
+                {
+                    "component": k.replace("_", " ").title(),
+                    "before": before.get(k),
+                    "after": after.get(k),
+                    "change": round((after.get(k, 0) - before.get(k, 0)), 1),
+                }
+                for k in after
+            ]
+        )
+        st.dataframe(delta_df, width="stretch", hide_index=True)
+
+        # ---- Why changed -------------------------------------------------
+        st.markdown("**Why changed**")
+        reasons = []
+        if after.get("skill_fit", 0) > before.get("skill_fit", 0):
+            covered_txt = ", ".join(newly_covered) if newly_covered else "JD-required skills"
+            reasons.append(
+                f"Skill Fit increased because temporary evidence mentions {covered_txt}, "
+                "which the JD requires."
+            )
+        elif newly_covered:
+            reasons.append(
+                "Added evidence covered " + ", ".join(newly_covered) +
+                ", though overall Skill Fit was already near its ceiling."
+            )
+        if after.get("experience_fit", 0) != before.get("experience_fit", 0):
+            reasons.append("Experience Fit changed because the evidence read as a concrete example.")
+        if after.get("resume_evidence_strength", 0) != before.get("resume_evidence_strength", 0):
+            reasons.append("Resume Evidence Strength changed from the added concrete/outcome evidence.")
+        if quality == "Skill claim only":
+            reasons.append(
+                "This is a skill claim only, so Experience Fit and Resume Evidence Strength "
+                "were intentionally not increased."
+            )
+        if abs(new_result["base_score"] - base_score) < 0.05 and not newly_covered:
+            reasons.append("No JD requirement was newly covered, so the score is essentially unchanged.")
+        for r in reasons:
+            st.markdown(f"- {r}")
+
+        if st.button("Save This Evidence to Evidence Library"):
+            st.info(
+                "Evidence Library is not enabled yet — nothing was saved. To make this "
+                "permanent, add it to your Candidate Profile manually."
+            )
+
+    # ====================================================================
+    # SECTION 3 — Save Job to Tracker
+    # ====================================================================
+    st.divider()
+    st.subheader("3. Save Job to Tracker")
+    if st.button("Save Job to Tracker", type="primary"):
+        analysis_id = _persist_current_analysis()
+        note = (
+            f"Fit base {base_score}/10 ({decision}, {priority}). "
+            f"{inputs.get('notes', '')}".strip()
+        )
+        rid, created = db.add_or_update_application_from_analysis(
+            company=inputs.get("company", ""),
+            job_title=inputs.get("job_title", ""),
+            job_url=inputs.get("apply_link", ""),
+            status="Saved / To Apply",
+            analysis_score=base_score,
+            role_family=role_family,
+            notes=note,
+        )
+        verb = "Added" if created else "Updated"
+        st.success(f"{verb} in Application Tracker (id {rid}). Analysis saved (id {analysis_id}).")
+
+    # ====================================================================
+    # SECTION 4 — Generate Tailored Resume
+    # ====================================================================
+    st.divider()
+    st.subheader("4. Generate Tailored Resume")
+    if st.button("Generate Tailored Resume for This Job"):
+        st.session_state["analyze_show_resume"] = True
+    if st.session_state.get("analyze_show_resume"):
+        st.caption(
+            f"Suggested angle from analysis: **{result['suggested_resume_angle']}** "
+            "(uses your verified material only)."
+        )
+        job_row = {
+            "job_id": "analyze_" + (inputs.get("company", "") + "_" + inputs.get("job_title", "")).replace(" ", "_")[:40],
+            "company": inputs.get("company", ""),
+            "job_title": inputs.get("job_title", ""),
+            "location": "",
+            "job_url": inputs.get("apply_link", ""),
+            "description": inputs.get("jd_text", ""),
+            "responsibilities": result["parsed"].get("responsibilities", ""),
+            "qualifications": result["parsed"].get("qualifications", ""),
+        }
+        _render_resume_section(profile_text, job_row)
+
 
 def page_candidate_profile():
     st.header("Candidate Profile")
@@ -798,6 +1259,7 @@ def main():
     page = st.sidebar.radio(
         "Navigation",
         [
+            "Analyze Job",
             "Candidate Profile",
             "Job Matching",
             "Generated Versions",
@@ -808,7 +1270,9 @@ def main():
         ],
     )
 
-    if page == "Candidate Profile":
+    if page == "Analyze Job":
+        page_analyze_job()
+    elif page == "Candidate Profile":
         page_candidate_profile()
     elif page == "Job Matching":
         page_job_matching()

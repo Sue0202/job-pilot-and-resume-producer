@@ -193,6 +193,92 @@ owner's verified resume generator.
 
 ---
 
+## 10. Post-submission JobPilot v2: JD Intake and Fit Diagnosis
+
+**Purpose:** Upgrade the class project into a personal job-search copilot by adding a
+one-JD intake + conservative fit-diagnosis workflow, without rewriting the app or
+removing any existing class-project feature.
+
+**Prompt (condensed):**
+> Add a new top sidebar page **Analyze Job** for one-JD intake (company, title, apply
+> link, source, JD text, notes) and fit diagnosis. Create `jd_analyzer.py` with rule-based
+> `parse_jd` (responsibilities, qualifications, required/preferred skills, tools, seniority
+> signals, role keywords, sponsorship signals, risk flags) and `analyze_fit` returning an
+> overall 0–10 score, a decision (High Priority / Apply with Tailoring / Maybe / Skip),
+> component scores with fixed weights (role 20, experience 25, skill 15, seniority 15,
+> transferability 10, sponsorship 5, evidence 10), matched/missing evidence, evidence-gap
+> questions, red flags, recommended positioning, and a scoring explanation. Keep scoring
+> conservative — do not overrate roles needing hard tech skills, clearance, CPA,
+> quota-carrying sales, or many years of direct domain experience. When score < 6.5, show
+> evidence-gap questions plus a temporary "added evidence" re-analyze loop that never
+> overwrites the master profile. Add a score-feedback section (saved, not auto-applied),
+> a Save-to-Tracker handoff, and a Generate-Tailored-Resume handoff that reuses the
+> verified resume generator. Add `job_analyses` and `score_feedback` SQLite tables without
+> touching existing tables.
+
+**How AI was used:**
+- Built `jd_analyzer.py` as a self-contained, testable module (regex + keyword banks),
+  with hard-requirement detection that caps the overall score toward Skip (sponsorship
+  blockers cap hardest).
+- Added two new SQLite tables and an `applications` upsert with safe optional columns
+  (`analysis_score`, `role_family`) so the tracker handoff never breaks the existing schema.
+- Reused the existing rule-based resume generator for the handoff so persona/verified
+  material constraints are preserved (no fabrication, master profile never overwritten).
+
+---
+
+## 11. JobPilot v2.1: Score Calibration and Split Feedback Loop
+
+**Purpose:** Make the Analyze Job fit scoring stricter and more truthful, and turn
+feedback into a useful, explainable calibration loop separated from added-evidence
+re-analysis.
+
+**Prompt (condensed):**
+> Make scoring more conservative with stricter bands (≥ 8.5 High Priority, 7.0–8.4 Apply
+> with Tailoring, 5.5–6.9 Maybe, < 5.5 Skip) plus a Priority and Confidence label. Resume
+> Evidence Strength must not default near 10 — cap at 6.5 (adjacent only), 8.0 (single
+> indirect transferable), 9.0+ only with multiple direct examples covering core
+> responsibilities, with credit for outcomes/metrics. Add hard penalties for no
+> sponsorship, US-citizen/clearance, over-seniority, deep SWE/ML without evidence, and
+> quota/licensed roles. Rename "Sponsorship Market Risk" to "Sponsorship Feasibility"
+> (higher = better). Split feedback into (A) Score Calibration Feedback that stores a
+> calibrated score (base ± magnitude) without overwriting the base, and (B) Add Evidence
+> and Re-analyze with a before/after comparison. Apply a small, visible role-family
+> calibration (max ±0.3) to new JDs in a family with prior feedback. Add tests.
+
+**How AI was used:**
+- Reworked `jd_analyzer.py` evidence scoring to distinguish **direct vs. adjacent**
+  evidence and measure **core-responsibility coverage**, with explicit caps and
+  hard-penalty caps; added `priority_for`, `decision_for`, and `apply_calibration` helpers
+  and a one-line score explanation.
+- Extended `database.py` (`job_analyses`, `score_feedback`) with calibration columns via
+  safe `ALTER TABLE`, and added `get_calibration_adjustment(role_family)` (clamped ±0.3).
+- Split the Analyze Job UI into four clearly separated sections (Calibration Feedback,
+  Add Evidence & Re-analyze, Save to Tracker, Generate Resume) and relabeled the headline
+  to Base Fit Score / Priority / Confidence.
+- Added `test_jd_analyzer.py` covering the high-fit, borderline, ML/clearance, added-
+  evidence, calibration, and profile-unchanged cases.
+
+**Follow-up — clearer Added Evidence re-analysis results:**
+> The re-analysis showed "Newly matched evidence: 0" even when added skills (Salesforce,
+> Tableau) correctly raised Skill Fit. Split the output into (A) new JD requirements
+> covered by the added evidence and (B) new verified evidence items matched; add an
+> evidence-quality label (Skill claim only / Concrete / Outcome-backed) with rules so a
+> skill claim only improves Skill Fit but not Experience Fit or Resume Evidence Strength;
+> and add a "Why changed" explanation. Scoring, calibration, tracker, and resume behavior
+> unchanged. Implemented as UI helpers (`_classify_evidence_quality`,
+> `_newly_covered_skills`) in `app.py` without touching the scoring model.
+
+**Base vs. calibrated vs. re-analysis (key distinction):**
+- **Base Fit Score** = the model's conservative rule-based score for the JD as written.
+- **Calibrated Score** = Base ± a user adjustment from Score Calibration Feedback; saved
+  separately, base never changes. Aggregated per role family it becomes a small (±0.3)
+  visible adjustment on future JDs in that family.
+- **Added-Evidence Re-analysis** = a fresh full re-score after temporarily appending
+  user-supplied evidence (never written to the master profile), shown as before/after.
+
+---
+
 ## Appendix — Build Iterations (summary)
 
 1. **Round 1:** initial MVP (sections 1–2 above, plus matching and DOCX/TXT export).
@@ -204,3 +290,8 @@ owner's verified resume generator.
 5. **Round 4 (weakness improvement):** dense/hybrid ranking with TF-IDF fallback,
    stream-style ingestion documentation, batch analytics, and persona evaluation
    (section 9).
+6. **v2 (personal copilot):** Analyze Job one-JD intake + conservative fit diagnosis,
+   evidence-gap loop, score feedback, and tracker/resume handoffs (section 10).
+7. **v2.1 (calibration):** stricter score bands, priority/confidence, conservative
+   evidence-strength caps, hard penalties, Sponsorship Feasibility, and a split
+   calibration / added-evidence feedback loop with tests (section 11).
