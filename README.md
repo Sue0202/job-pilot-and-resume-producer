@@ -13,6 +13,55 @@ job-search copilot.
 - **Live app:** https://job-pilot-and-resume-tailor.streamlit.app/
 - **Source code:** https://github.com/Sue0202/job-pilot-and-resume-producer
 
+## Product Workflow
+
+JobPilot is positioned as **Job Search Decision Support & Resume Tailoring**. It supports
+a decision-first workflow:
+
+**Analyze Job → Decide → Add Evidence → Tailor Resume → Track Application → Learn from Outcomes**
+
+It deliberately differs from a generic AI resume generator: it scores fit **conservatively**,
+distinguishes **direct** evidence from **transferable / adjacent** evidence, **does not
+fabricate experience**, and helps you decide whether to apply **before** generating a
+resume — while preserving resume-version and application history.
+
+### Navigation (workflow-oriented sidebar)
+
+The active sidebar focuses on the personal job-search workflow. Course-project tools are
+preserved but moved under an **Advanced (course project)** expander (not removed, not
+required at runtime):
+
+| Group | Pages |
+| --- | --- |
+| **Workspace** | Home · Analyze Job · Applications · Resume Library · Evidence Library |
+| **Settings** | Candidate Profile |
+| **Advanced (course project)** | Job Matching · Insights · Test Personas · Project README |
+
+Renamed pages (functionality unchanged): **Application Tracker → Applications**,
+**Generated Versions → Resume Library**, **Batch Analytics → Insights**. A new **Home**
+dashboard is the default landing page and summarizes the pipeline plus recent activity,
+with practical empty states when the workspace is new. The app does **not** load any
+external processed job dataset at startup (datasets load only on the Advanced pages).
+
+### Profile safety
+
+The candidate master profile (`candidate_master_profile.md`) is the single verified
+source for resume generation. Test personas / demo / sample profiles are fully isolated
+and can never be saved over it: `save_profile_text` refuses test-persona-formatted
+content, the Candidate Profile page shows the **active profile name**, and no
+test/demo/analysis flow ever writes the master profile.
+
+### Evidence Library
+
+A structured library of reusable, verifiable experience evidence (title, company,
+action, outcome, skills, tags, status). Only **Verified** items are eligible for resume
+generation. Temporary re-analysis notes are **never** saved automatically — you choose
+"Use only for this analysis", "Save as Draft", or "Save as Verified".
+
+A restrained, professional theme is configured in `.streamlit/config.toml` (safe on
+Streamlit Community Cloud), with light CSS for content width and type hierarchy injected
+from `app.py`. No external frontend framework, auth, or paid services are used.
+
 ## MVP Features
 
 - **Analyze Job (primary workflow)** — paste **one** job description (with company, title,
@@ -85,10 +134,10 @@ job-search copilot.
 - **Feedback learning** — rate a job (Interested, Not Interested, Too Senior, Wrong
   Location, Good Match); saved feedback lightly boosts/penalizes role families and
   keywords on the next ranking run.
-- **Batch Analytics** — aggregate insights over the processed dataset: jobs by role
-  family, top locations/companies, top keyword/skill demand, source and employment-type
-  distributions, and a missing-data audit (salary / job_url / location). Download the
-  summary as CSV.
+- **Insights** (formerly Batch Analytics) — aggregate insights over the processed
+  dataset, organized into KPI cards plus grouped sections (Market Overview, Role Demand,
+  Geography & Employers, Data Quality) with concise, data-driven interpretation text and
+  expanders for less-important distributions. Download the summary as CSV.
 - **Test Personas** — evaluate recommendation quality for the four official personas
   (Aisha, Marcus, Priya, Kenji) with rule-based pass/fail checks and a downloadable
   evaluation CSV. Personas are used for **ranking evaluation only** and never reuse the
@@ -99,13 +148,17 @@ job-search copilot.
 - **Feedback / Refinement** — enter feedback (e.g. "make it more platform operations
   focused") and regenerate a new version.
 - **Exports** — download as styled DOCX (python-docx) or plain TXT.
-- **Generated Versions** — every generated resume is persisted in SQLite and listed
-  with id, timestamp, company, job title, target title, match score, and feedback used.
-  Select any version by id to view and re-download its full text.
-- **Application Tracker** — manual single-record add **and** batch CSV upload, with
-  executive summary metrics (Total, Saved, Applied, Interview, Rejected/Closed), a
-  status filter, and inline status/notes updates. A `sample_applications.csv` and a
-  downloadable CSV template are provided.
+- **Resume Library** (formerly Generated Versions) — every generated resume is persisted
+  in SQLite and shown as a version-history workspace: summary metrics (total versions,
+  created this week, jobs with tailored resumes), filters (company, angle, keyword), a
+  clean table, and a detail panel with job context, refinement notes, a verified-evidence
+  indicator, and **TXT / DOCX** downloads.
+- **Applications** (formerly Application Tracker) — a job-pipeline view with summary
+  metrics (Total, Saved / To Apply, Applied, Interview, Offer, Closed / Rejected),
+  filters (status, company, role family, search), weekly activity charts, and a detail
+  panel (apply link, fit score, analysis summary, status updates). Manual single-record
+  add **and** batch CSV upload are preserved (under expanders). A `sample_applications.csv`
+  and a downloadable CSV template are provided.
 
 ## Tech Stack
 

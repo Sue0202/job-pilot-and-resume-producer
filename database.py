@@ -107,10 +107,74 @@ def init_db():
         )
         """
     )
+    # v3: structured Evidence Library. Temporary re-analysis notes are NEVER written
+    # here automatically; only an explicit "Save to Evidence Library" creates a row.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            company TEXT,
+            role_context TEXT,
+            time_period TEXT,
+            category TEXT,
+            skills TEXT,
+            action TEXT,
+            outcome TEXT,
+            raw_notes TEXT,
+            bullet_draft TEXT,
+            status TEXT,
+            tags TEXT,
+            source_job_analysis_id INTEGER,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    # v3: transparent resume/recommendation preference feedback (bounded, explainable).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS preference_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT,
+            role_family TEXT,
+            preference TEXT,
+            notes TEXT,
+            created_at TEXT
+        )
+        """
+    )
     # v2: add safe optional columns to applications for analysis handoff.
     _ensure_columns(cur, "applications", {
         "analysis_score": "REAL",
         "role_family": "TEXT",
+    })
+    # v3: richer application tracker columns (non-destructive).
+    _ensure_columns(cur, "applications", {
+        "source": "TEXT",
+        "location": "TEXT",
+        "recommendation": "TEXT",
+        "resume_version_id": "INTEGER",
+        "analyzed_date": "TEXT",
+        "applied_date": "TEXT",
+        "next_action_date": "TEXT",
+        "updated_at": "TEXT",
+    })
+    # v3: resume version provenance (which job/angle/evidence produced it).
+    _ensure_columns(cur, "resume_versions", {
+        "jd_snapshot": "TEXT",
+        "selected_angle": "TEXT",
+        "decision_at_generation": "TEXT",
+        "score_at_generation": "REAL",
+        "evidence_used_json": "TEXT",
+        "job_analysis_id": "INTEGER",
+    })
+    # v3.1: evidence translation / positioning fields (non-destructive).
+    _ensure_columns(cur, "evidence_items", {
+        "original_industry_context": "TEXT",
+        "capability_tags": "TEXT",
+        "target_role_translations": "TEXT",
+        "proof_strength": "TEXT",
     })
     # v2.1: calibration + diagnosis detail columns (non-destructive).
     _ensure_columns(cur, "job_analyses", {
@@ -142,7 +206,8 @@ def _ensure_columns(cur, table, columns):
 
 
 def add_or_update_application_from_analysis(
-    company, job_title, job_url, status, analysis_score=None, role_family="", notes=""
+    company, job_title, job_url, status, analysis_score=None, role_family="", notes="",
+    source="", location="", recommendation="",
 ):
     """Upsert an application from a job analysis, keyed by (company, job_title).
 
@@ -158,14 +223,18 @@ def add_or_update_application_from_analysis(
     )
     row = cur.fetchone()
     score_val = float(analysis_score) if analysis_score is not None else None
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today = datetime.now().strftime("%Y-%m-%d")
     if row:
         cur.execute(
             """
             UPDATE applications
-            SET job_url = ?, status = ?, analysis_score = ?, role_family = ?, notes = ?
+            SET job_url = ?, status = ?, analysis_score = ?, role_family = ?, notes = ?,
+                source = ?, location = ?, recommendation = ?, analyzed_date = ?, updated_at = ?
             WHERE id = ?
             """,
-            (str(job_url), str(status), score_val, str(role_family), str(notes), row["id"]),
+            (str(job_url), str(status), score_val, str(role_family), str(notes),
+             str(source), str(location), str(recommendation), today, now, row["id"]),
         )
         conn.commit()
         rid = row["id"]
@@ -175,11 +244,12 @@ def add_or_update_application_from_analysis(
         """
         INSERT INTO applications (
             created_at, company, job_title, job_url, status,
-            application_date, notes, analysis_score, role_family
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            application_date, notes, analysis_score, role_family,
+            source, location, recommendation, analyzed_date, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            now,
             str(company),
             str(job_title),
             str(job_url),
@@ -188,12 +258,42 @@ def add_or_update_application_from_analysis(
             str(notes),
             score_val,
             str(role_family),
+            str(source),
+            str(location),
+            str(recommendation),
+            today,
+            now,
         ),
     )
     conn.commit()
     rid = cur.lastrowid
     conn.close()
     return rid, True
+
+
+def update_application_fields(application_id, fields):
+    """Update arbitrary safe columns of an application. Returns rows affected."""
+    init_db()
+    allowed = {
+        "company", "job_title", "job_url", "status", "application_date", "notes",
+        "analysis_score", "role_family", "source", "location", "recommendation",
+        "resume_version_id", "analyzed_date", "applied_date", "next_action_date",
+    }
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return 0
+    conn = _connect()
+    cur = conn.cursor()
+    sets["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    assignments = ", ".join(f"{k} = ?" for k in sets)
+    cur.execute(
+        f"UPDATE applications SET {assignments} WHERE id = ?",
+        list(sets.values()) + [int(application_id)],
+    )
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
 
 
 def save_resume_version(
@@ -206,8 +306,18 @@ def save_resume_version(
     missing_keywords,
     feedback_text,
     resume_text,
+    jd_snapshot="",
+    selected_angle="",
+    decision_at_generation="",
+    score_at_generation=None,
+    evidence_used_json="",
+    job_analysis_id=None,
 ):
-    """Persist a generated resume version. Returns the new row id."""
+    """Persist a generated resume version. Returns the new row id.
+
+    Each call creates a NEW row (feedback never overwrites an earlier version).
+    Optional provenance fields record the job/angle/evidence used.
+    """
     init_db()
     conn = _connect()
     cur = conn.cursor()
@@ -216,8 +326,10 @@ def save_resume_version(
         INSERT INTO resume_versions (
             created_at, company, job_title, job_id, target_title,
             match_score, matched_keywords, missing_keywords,
-            feedback_text, resume_text
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            feedback_text, resume_text,
+            jd_snapshot, selected_angle, decision_at_generation,
+            score_at_generation, evidence_used_json, job_analysis_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -230,6 +342,12 @@ def save_resume_version(
             missing_keywords,
             feedback_text,
             resume_text,
+            jd_snapshot,
+            selected_angle,
+            decision_at_generation,
+            float(score_at_generation) if score_at_generation is not None else None,
+            evidence_used_json,
+            job_analysis_id,
         ),
     )
     conn.commit()
@@ -557,6 +675,126 @@ def get_score_feedback(job_analysis_id=None):
             "SELECT * FROM score_feedback WHERE job_analysis_id = ? ORDER BY id DESC",
             (int(job_analysis_id),),
         )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Evidence Library (v3)
+# ---------------------------------------------------------------------------
+
+EVIDENCE_FIELDS = [
+    "title", "company", "role_context", "time_period", "category", "skills",
+    "action", "outcome", "raw_notes", "bullet_draft", "status", "tags",
+    "source_job_analysis_id", "original_industry_context", "capability_tags",
+    "target_role_translations", "proof_strength",
+]
+
+
+def save_evidence_item(item):
+    """Insert a new evidence item. Returns the new row id.
+
+    Only called from an explicit 'Save to Evidence Library' action.
+    """
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cols = EVIDENCE_FIELDS + ["created_at", "updated_at"]
+    vals = [item.get(f, "") for f in EVIDENCE_FIELDS] + [now, now]
+    placeholders = ", ".join(["?"] * len(cols))
+    cur.execute(
+        f"INSERT INTO evidence_items ({', '.join(cols)}) VALUES ({placeholders})",
+        vals,
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def get_evidence_items(status=None):
+    """Return evidence items, newest first; optionally filtered by status."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    if status:
+        cur.execute("SELECT * FROM evidence_items WHERE status = ? ORDER BY id DESC", (status,))
+    else:
+        cur.execute("SELECT * FROM evidence_items ORDER BY id DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_evidence_item(item_id):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM evidence_items WHERE id = ?", (int(item_id),))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_evidence_item(item_id, fields):
+    """Update selected fields of an evidence item. Returns rows affected."""
+    init_db()
+    allowed = set(EVIDENCE_FIELDS)
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return 0
+    conn = _connect()
+    cur = conn.cursor()
+    sets["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    assignments = ", ".join(f"{k} = ?" for k in sets)
+    cur.execute(
+        f"UPDATE evidence_items SET {assignments} WHERE id = ?",
+        list(sets.values()) + [int(item_id)],
+    )
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def get_verified_evidence():
+    """Verified evidence items only — the pool eligible for resume generation."""
+    return get_evidence_items(status="Verified")
+
+
+# ---------------------------------------------------------------------------
+# Preference feedback (v3) — transparent, bounded personalization
+# ---------------------------------------------------------------------------
+
+def save_preference_feedback(scope, preference, role_family="", notes=""):
+    """Record a resume/recommendation preference. Returns the new row id."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur.execute(
+        """
+        INSERT INTO preference_feedback (scope, role_family, preference, notes, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (scope, str(role_family or ""), preference, notes, now),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def get_preference_feedback(scope=None):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    if scope:
+        cur.execute("SELECT * FROM preference_feedback WHERE scope = ? ORDER BY id DESC", (scope,))
+    else:
+        cur.execute("SELECT * FROM preference_feedback ORDER BY id DESC")
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows

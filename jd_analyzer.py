@@ -46,6 +46,14 @@ ROLE_FAMILY_KEYWORDS = {
         "business operations", "business ops", "bizops", "operations manager",
         "strategy and operations", "strategy & operations", "revenue operations",
     ],
+    "Business Systems / Internal Tools / Enterprise Operations Systems": [
+        "business systems", "business system", "people systems", "people system",
+        "hris", "workday", "netsuite", "employee lifecycle", "employee life cycle",
+        "enterprise integration", "enterprise integrations", "erp", "internal tools",
+        "internal tool", "business process", "business-process", "systems implementation",
+        "3pl", "servicenow", "sap", "business systems analyst", "systems analyst",
+        "enterprise systems", "people operations systems",
+    ],
     "Workflow / CX Operations": [
         "workflow", "cx operations", "customer experience operations",
         "process improvement", "operations analyst", "operational excellence",
@@ -82,6 +90,7 @@ FAMILY_TO_ANGLE = {
     "Product Operations": "A",
     "Program Management": "A",
     "Business Operations": "A",
+    "Business Systems / Internal Tools / Enterprise Operations Systems": "A",
     "Creator / Content Operations": "A",
     "Product Analytics / Marketing Analytics": "A",
     "AI Workflow / Automation Operations": "A",
@@ -145,10 +154,10 @@ def _suggested_angle(role_family, text_low):
 
 # Tools / platforms commonly named in JDs.
 TOOL_BANK = [
-    "sql", "python", "r", "excel", "google sheets", "tableau", "power bi",
+    "sql", "python", "javascript", "html", "r", "excel", "google sheets", "tableau", "power bi",
     "looker", "sigma", "snowflake", "bigquery", "airflow", "dbt", "jira",
-    "asana", "confluence", "notion", "figma", "salesforce", "zendesk",
-    "intercom", "hubspot", "git", "spark", "kafka", "kubernetes", "aws",
+    "asana", "confluence", "notion", "figma", "lucidchart", "salesforce", "workday", "netsuite",
+    "zendesk", "intercom", "hubspot", "git", "spark", "kafka", "kubernetes", "aws",
     "gcp", "azure", "powerpoint", "pytorch", "tensorflow",
 ]
 
@@ -177,6 +186,14 @@ CANDIDATE_SKILLS = {
 CANDIDATE_SKILL_GAPS = {
     "machine learning", "deep learning", "pytorch", "tensorflow", "spark",
     "kafka", "kubernetes", "dbt", "airflow",
+}
+
+# Enterprise domain / tool-syntax skills surfaced in the translation gap layer.
+# Excluded from skill_fit denominator so Workday/NetSuite/JS/HTML do not
+# double-penalize the base score alongside domain gap flags.
+SKILL_FIT_GAP_LAYER_SKILLS = {
+    "workday", "netsuite", "servicenow", "sap",
+    "javascript", "html", "figma", "lucidchart", "salesforce",
 }
 
 # Verified candidate evidence library. Each item declares:
@@ -493,6 +510,7 @@ def _candidate_tokens(candidate_profile_text):
 
 # Tie-break order reflecting where the candidate is strongest (earlier = stronger).
 FAMILY_PRIORITY = [
+    "Business Systems / Internal Tools / Enterprise Operations Systems",
     "Product Operations",
     "Program Management",
     "Platform Operations",
@@ -509,19 +527,34 @@ FAMILY_PRIORITY = [
 
 def _select_role_family(role_scores, matched_items):
     """Pick the JD's role family. Ties are broken toward the family where the
-    candidate has the most direct verified evidence, then by candidate strength."""
+    candidate has the most direct verified evidence, then by candidate strength.
+
+    Business-systems JDs prefer the dedicated enterprise-systems family over the
+    generic Workflow / CX Operations bucket when both match."""
     if not role_scores:
         return "Other / Unclear", 3.0
-    top = max(role_scores.values())
-    tied = [f for f, s in role_scores.items() if s == top]
 
-    def direct_count(f):
-        return sum(1 for m in matched_items if f in m["families"])
+    bs_family = "Business Systems / Internal Tools / Enterprise Operations Systems"
+    wf_family = "Workflow / CX Operations"
+    bs_score = role_scores.get(bs_family, 0)
+    wf_score = role_scores.get(wf_family, 0)
 
-    def prio(f):
-        return FAMILY_PRIORITY.index(f) if f in FAMILY_PRIORITY else len(FAMILY_PRIORITY)
+    # Enterprise people-systems / ERP JDs should not collapse into CX Operations.
+    if bs_score > 0 and (bs_score >= wf_score or wf_score <= 1):
+        family = bs_family
+        top = bs_score
+    else:
+        top = max(role_scores.values())
+        tied = [f for f, s in role_scores.items() if s == top]
 
-    family = max(tied, key=lambda f: (direct_count(f), -prio(f)))
+        def direct_count(f):
+            return sum(1 for m in matched_items if f in m["families"])
+
+        def prio(f):
+            return FAMILY_PRIORITY.index(f) if f in FAMILY_PRIORITY else len(FAMILY_PRIORITY)
+
+        family = max(tied, key=lambda f: (direct_count(f), -prio(f)))
+
     score = min(10.0, 5.5 + 1.5 * top)
     return family, round(score, 1)
 
@@ -552,7 +585,10 @@ def _score_seniority_fit(seniority_signals):
 
 
 def _score_skill_fit(required_skills, preferred_skills, candidate_text=""):
-    req = [s for s in required_skills if s in SKILL_BANK]
+    req = [
+        s for s in required_skills
+        if s in SKILL_BANK and s not in SKILL_FIT_GAP_LAYER_SKILLS
+    ]
     if not req:
         base = 5.5  # thin JD: be modest, not generous
     else:

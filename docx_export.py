@@ -129,6 +129,33 @@ def create_resume_docx(resume_data):
     return buffer.getvalue()
 
 
+def create_docx_from_text(resume_text, title=""):
+    """Build a simple DOCX from saved plain-text resume content. Returns bytes.
+
+    Used by the Resume Library where only the rendered text was persisted.
+    """
+    doc = Document()
+    if title:
+        p = doc.add_paragraph()
+        run = p.add_run(title)
+        run.bold = True
+        run.font.size = Pt(14)
+        p.paragraph_format.space_after = Pt(6)
+    for line in (resume_text or "").split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            doc.add_paragraph("")
+            continue
+        if stripped.startswith("•"):
+            _add_bullet(doc, stripped.lstrip("• ").strip())
+        else:
+            _add_body(doc, stripped)
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def create_resume_docx_from_template(template_path, resume_data):
     """Optional helper: replace {{PLACEHOLDERS}} in a .docx template.
 

@@ -291,6 +291,31 @@ re-analysis.
 
 ---
 
+## 12. Portfolio UX Redesign Prompt
+
+> This prompt reorganized the Streamlit interface into a practical job-search workflow and
+> improved visual hierarchy without changing the core scoring, data, or resume-generation
+> logic.
+
+Reorganized JobPilot's information architecture into a workflow-oriented, grouped sidebar
+(Workspace / Tools / Reference / Optional · Demo) and added a new **Home** dashboard
+(primary/secondary action cards, pipeline metrics from the database, recent activity, and
+empty states). Renamed pages for product clarity — Application Tracker → **Applications**,
+Generated Versions → **Resume Library**, Batch Analytics → **Insights** — while preserving
+every page and all data. Polished each surface: Analyze Job now reads as staged
+(Job Input → Decision Summary card → Why This Result two-column → Recommended Action with a
+decision-driven primary button), with calibration and evidence re-analysis tucked into
+expanders; Resume Library and Applications became filterable workspaces with summary
+metrics, detail panels, and (for resumes) TXT/DOCX export; Job Matching gained compact
+filters, ranking-method blurbs, per-recommendation *Analyze this job* / *Save to tracker*
+actions; Insights gained KPI cards, grouped sections, and data-driven interpretation text.
+Added a restrained theme (`.streamlit/config.toml` + light injected CSS), public-demo copy
+safeguards, and verified the redesign with a 9-page smoke AppTest and the existing
+`test_jd_analyzer.py` suite (all passing). No scoring weights, DB schema, analyzer,
+matcher, resume generator, or tests were changed except for UI wiring.
+
+---
+
 ## Appendix — Build Iterations (summary)
 
 1. **Round 1:** initial MVP (sections 1–2 above, plus matching and DOCX/TXT export).
@@ -307,3 +332,36 @@ re-analysis.
 7. **v2.1 (calibration):** stricter score bands, priority/confidence, conservative
    evidence-strength caps, hard penalties, Sponsorship Feasibility, and a split
    calibration / added-evidence feedback loop with tests (section 11).
+8. **Portfolio UX redesign:** workflow-grouped navigation, a new Home dashboard, renamed
+   pages, polished Analyze Job / Resume Library / Applications / Job Matching / Insights,
+   a restrained theme, and demo-safety copy — UI only, no logic changes (section 12).
+9. **Personal copilot refactor (v3):** profile-safety restore + guard, simplified
+   product navigation, Evidence Library, structured add-evidence with explicit
+   save (temp/draft/verified), evidence-aware resume generation with provenance,
+   expanded application tracker, and transparent preference personalization (section 13).
+
+---
+
+## 13. Personal Copilot Refactor Prompt (v3)
+
+> This prompt refactored JobPilot from a course-project prototype into a personal
+> Job Search Decision Support & Resume Tailoring copilot, with a critical profile-safety
+> restore and a structured Evidence Library — without changing the conservative scoring
+> engine, deleting data, or adding paid APIs.
+
+Phase 0 audited the Candidate Profile, found it had been overwritten by a test persona in
+commit `a78162b`, and restored the real Yeyi Su master profile from the initial commit
+`bba0a09`; added a `looks_like_test_persona` save guard, an active-profile-name display,
+and confirmed no test/demo flow writes the master profile. Subsequent phases simplified
+the active navigation (Workspace + Settings; course-project tools moved under an Advanced
+expander; no dataset loaded at startup), rebuilt the Home dashboard around real pipeline
+data, added structured inputs and a customizable target-role angle to Analyze Job, added
+an **Evidence Library** (`evidence_items` table with Draft/Verified/Archived status and
+CRUD) plus a structured add-evidence-and-re-analyze flow with explicit save choices
+(temporary / draft / verified — nothing auto-saved), made resume generation use the
+verified master profile plus selected verified evidence and record provenance
+(JD snapshot, angle, decision/score at generation, evidence used) while keeping each
+feedback pass a new version, expanded the application tracker (richer statuses, fields,
+next-actions view), and added transparent, bounded preference personalization
+(`preference_feedback`) alongside the existing role-family calibration. All schema changes
+are additive (`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN`); no rows were deleted.
