@@ -176,6 +176,75 @@ def init_db():
         "target_role_translations": "TEXT",
         "proof_strength": "TEXT",
     })
+    # v3.4: factual source vs generated verbal outputs (additive).
+    _ensure_columns(cur, "evidence_items", {
+        "factual_context": "TEXT",
+        "impact_outcome": "TEXT",
+    })
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_verbal_outputs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evidence_item_id INTEGER NOT NULL,
+            role_family TEXT,
+            job_analysis_id INTEGER,
+            output_type TEXT NOT NULL,
+            generated_text TEXT,
+            user_approved INTEGER DEFAULT 0,
+            user_feedback TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    # v3.5: canonical/preferred verbal metadata (additive).
+    _ensure_columns(cur, "evidence_verbal_outputs", {
+        "role_family_normalized": "TEXT",
+        "is_preferred": "INTEGER",
+        "source": "TEXT",
+        "feedback_tags": "TEXT",
+        "feedback_note": "TEXT",
+    })
+    # v3.2: resume review + translation feedback (behavior-driven, not score weights).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS translation_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resume_version_id INTEGER,
+            analysis_id INTEGER,
+            evidence_item_id INTEGER,
+            role_family TEXT,
+            source_text TEXT,
+            generated_text TEXT,
+            final_text TEXT,
+            action_type TEXT,
+            feedback_tags TEXT,
+            notes TEXT,
+            bullet_index INTEGER,
+            created_at TEXT
+        )
+        """
+    )
+    _ensure_columns(cur, "resume_versions", {
+        "review_usefulness": "TEXT",
+        "review_tags": "TEXT",
+        "review_notes": "TEXT",
+        "bullet_state_json": "TEXT",
+    })
+    # v3.3: user-controlled evidence vocabulary (categories, tags, skill suggestions).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_vocabulary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vocab_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            norm_key TEXT NOT NULL,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(vocab_type, norm_key)
+        )
+        """
+    )
     # v2.1: calibration + diagnosis detail columns (non-destructive).
     _ensure_columns(cur, "job_analyses", {
         "base_score": "REAL",
@@ -192,8 +261,32 @@ def init_db():
         "calibrated_score": "REAL",
         "role_family": "TEXT",
     })
+    _backfill_verbal_role_family_normalized(cur)
     conn.commit()
     conn.close()
+
+
+def _backfill_verbal_role_family_normalized(cur):
+    """Populate role_family_normalized for legacy verbal output rows."""
+    cur.execute(
+        "SELECT id, role_family, role_family_normalized FROM evidence_verbal_outputs"
+    )
+    import re
+
+    def _norm(v):
+        s = re.sub(r"\s+", " ", (v or "").strip())
+        s = s.replace("–", "-").replace("—", "-")
+        return s.lower()
+
+    for row in cur.fetchall():
+        if (row["role_family_normalized"] or "").strip():
+            continue
+        rf = (row["role_family"] or "").strip()
+        if rf:
+            cur.execute(
+                "UPDATE evidence_verbal_outputs SET role_family_normalized = ? WHERE id = ?",
+                (_norm(rf), row["id"]),
+            )
 
 
 def _ensure_columns(cur, table, columns):
@@ -312,6 +405,10 @@ def save_resume_version(
     score_at_generation=None,
     evidence_used_json="",
     job_analysis_id=None,
+    review_usefulness="",
+    review_tags="",
+    review_notes="",
+    bullet_state_json="",
 ):
     """Persist a generated resume version. Returns the new row id.
 
@@ -328,8 +425,9 @@ def save_resume_version(
             match_score, matched_keywords, missing_keywords,
             feedback_text, resume_text,
             jd_snapshot, selected_angle, decision_at_generation,
-            score_at_generation, evidence_used_json, job_analysis_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            score_at_generation, evidence_used_json, job_analysis_id,
+            review_usefulness, review_tags, review_notes, bullet_state_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -348,6 +446,10 @@ def save_resume_version(
             float(score_at_generation) if score_at_generation is not None else None,
             evidence_used_json,
             job_analysis_id,
+            review_usefulness or "",
+            review_tags or "",
+            review_notes or "",
+            bullet_state_json or "",
         ),
     )
     conn.commit()
@@ -688,7 +790,7 @@ EVIDENCE_FIELDS = [
     "title", "company", "role_context", "time_period", "category", "skills",
     "action", "outcome", "raw_notes", "bullet_draft", "status", "tags",
     "source_job_analysis_id", "original_industry_context", "capability_tags",
-    "target_role_translations", "proof_strength",
+    "target_role_translations", "proof_strength", "factual_context", "impact_outcome",
 ]
 
 
@@ -701,8 +803,18 @@ def save_evidence_item(item):
     conn = _connect()
     cur = conn.cursor()
     now = datetime.utcnow().isoformat(timespec="seconds")
+    # Normalize: ensure status is explicit; sync legacy action/outcome from factual fields.
+    record = dict(item)
+    if record.get("factual_context") and not record.get("action"):
+        record["action"] = (record["factual_context"] or "")[:2000]
+    if record.get("impact_outcome") and not record.get("outcome"):
+        record["outcome"] = record["impact_outcome"]
+    status = (record.get("status") or "Draft").strip()
+    if status not in ("Draft", "Verified", "Archived"):
+        status = "Draft"
+    record["status"] = status
     cols = EVIDENCE_FIELDS + ["created_at", "updated_at"]
-    vals = [item.get(f, "") for f in EVIDENCE_FIELDS] + [now, now]
+    vals = [record.get(f, "") or "" for f in EVIDENCE_FIELDS] + [now, now]
     placeholders = ", ".join(["?"] * len(cols))
     cur.execute(
         f"INSERT INTO evidence_items ({', '.join(cols)}) VALUES ({placeholders})",
@@ -764,6 +876,434 @@ def get_verified_evidence():
     return get_evidence_items(status="Verified")
 
 
+def backfill_evidence_factual_fields():
+    """Safe additive backfill: populate factual_context from legacy fields when empty."""
+    init_db()
+    items = get_evidence_items()
+    for item in items:
+        updates = {}
+        if not (item.get("factual_context") or "").strip():
+            parts = [
+                item.get("action"),
+                item.get("original_industry_context"),
+                item.get("raw_notes"),
+            ]
+            combined = "\n\n".join(p.strip() for p in parts if p and str(p).strip())
+            if combined:
+                updates["factual_context"] = combined
+        if not (item.get("impact_outcome") or "").strip() and (item.get("outcome") or "").strip():
+            updates["impact_outcome"] = item["outcome"]
+        if updates:
+            update_evidence_item(item["id"], updates)
+
+
+# ---------------------------------------------------------------------------
+# Evidence verbal outputs (v3.4+) — generated wording separate from source facts
+# ---------------------------------------------------------------------------
+
+VERBAL_OUTPUT_ALLOWED = {
+    "generated_text", "user_approved", "user_feedback", "role_family",
+    "role_family_normalized", "is_preferred", "source", "feedback_tags", "feedback_note",
+}
+
+
+def insert_verbal_output(
+    evidence_item_id,
+    output_type,
+    generated_text,
+    role_family="",
+    role_family_normalized="",
+    job_analysis_id=None,
+    user_approved=False,
+    is_preferred=False,
+    source="generated",
+    user_feedback="",
+    feedback_tags="",
+    feedback_note="",
+):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur.execute(
+        """
+        INSERT INTO evidence_verbal_outputs (
+            evidence_item_id, role_family, role_family_normalized, job_analysis_id,
+            output_type, generated_text, user_approved, is_preferred, source,
+            user_feedback, feedback_tags, feedback_note, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(evidence_item_id),
+            role_family or "",
+            role_family_normalized or "",
+            job_analysis_id,
+            output_type,
+            generated_text or "",
+            1 if user_approved else 0,
+            1 if is_preferred else 0,
+            source or "generated",
+            user_feedback or "",
+            feedback_tags or "",
+            feedback_note or "",
+            now,
+            now,
+        ),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def save_verbal_output(
+    evidence_item_id,
+    output_type,
+    generated_text,
+    role_family="",
+    job_analysis_id=None,
+    user_approved=False,
+    user_feedback="",
+    role_family_normalized="",
+    is_preferred=False,
+    source="generated",
+    feedback_tags="",
+    feedback_note="",
+):
+    """Insert a new verbal output row (legacy-compatible wrapper)."""
+    return insert_verbal_output(
+        evidence_item_id, output_type, generated_text,
+        role_family=role_family,
+        role_family_normalized=role_family_normalized,
+        job_analysis_id=job_analysis_id,
+        user_approved=user_approved,
+        is_preferred=is_preferred,
+        source=source,
+        user_feedback=user_feedback,
+        feedback_tags=feedback_tags,
+        feedback_note=feedback_note,
+    )
+
+
+def get_verbal_outputs(evidence_item_id, output_type=None):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    if output_type:
+        cur.execute(
+            """
+            SELECT * FROM evidence_verbal_outputs
+            WHERE evidence_item_id = ? AND output_type = ?
+            ORDER BY id DESC
+            """,
+            (int(evidence_item_id), output_type),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT * FROM evidence_verbal_outputs
+            WHERE evidence_item_id = ?
+            ORDER BY id DESC
+            """,
+            (int(evidence_item_id),),
+        )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def update_verbal_output(output_id, fields):
+    init_db()
+    allowed = VERBAL_OUTPUT_ALLOWED
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return 0
+    conn = _connect()
+    cur = conn.cursor()
+    sets["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    if "user_approved" in sets:
+        sets["user_approved"] = 1 if sets["user_approved"] else 0
+    if "is_preferred" in sets:
+        sets["is_preferred"] = 1 if sets["is_preferred"] else 0
+    assignments = ", ".join(f"{k} = ?" for k in sets)
+    cur.execute(
+        f"UPDATE evidence_verbal_outputs SET {assignments} WHERE id = ?",
+        list(sets.values()) + [int(output_id)],
+    )
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def delete_verbal_output(output_id):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM evidence_verbal_outputs WHERE id = ?", (int(output_id),))
+    conn.commit()
+    conn.close()
+
+
+def _resolve_role_family_normalized(role_family, role_family_normalized=None):
+    if (role_family_normalized or "").strip():
+        return role_family_normalized.strip()
+    if (role_family or "").strip():
+        import role_family_vocab as rfv
+        return rfv.normalize_role_family_key(role_family)
+    return ""
+
+
+def get_verbal_outputs_for_role(evidence_item_id, role_family, role_family_normalized=None):
+    """All verbal outputs for evidence + role family (normalized match)."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    rf_norm = _resolve_role_family_normalized(role_family, role_family_normalized)
+    cur.execute(
+        """
+        SELECT * FROM evidence_verbal_outputs
+        WHERE evidence_item_id = ? AND role_family_normalized = ?
+        ORDER BY is_preferred DESC, user_approved DESC, id DESC
+        """,
+        (int(evidence_item_id), rf_norm),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_verbal_output_for_role(evidence_item_id, output_type, role_family, role_family_normalized=None):
+    """Most recent verbal output for evidence + type + role family (normalized)."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    rf_norm = _resolve_role_family_normalized(role_family, role_family_normalized)
+    cur.execute(
+        """
+        SELECT * FROM evidence_verbal_outputs
+        WHERE evidence_item_id = ? AND output_type = ? AND role_family_normalized = ?
+        ORDER BY is_preferred DESC, user_approved DESC, id DESC LIMIT 1
+        """,
+        (int(evidence_item_id), output_type, rf_norm),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_preferred_verbal_output(evidence_item_id, output_type, role_family_normalized):
+    """Preferred or approved wording for resume retrieval."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM evidence_verbal_outputs
+        WHERE evidence_item_id = ? AND output_type = ? AND role_family_normalized = ?
+          AND (is_preferred = 1 OR user_approved = 1)
+        ORDER BY is_preferred DESC, user_approved DESC, id DESC LIMIT 1
+        """,
+        (int(evidence_item_id), output_type, role_family_normalized),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_verbal_outputs_by_slot(evidence_item_id, output_type, role_family_normalized):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM evidence_verbal_outputs
+        WHERE evidence_item_id = ? AND output_type = ? AND role_family_normalized = ?
+        ORDER BY id DESC
+        """,
+        (int(evidence_item_id), output_type, role_family_normalized),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def canonical_seed_decision(evidence_item_id, output_type, role_family_normalized, generated_text):
+    """Return ('insert'|'skip_idempotent'|'skip_protected', reason)."""
+    rows = get_verbal_outputs_by_slot(evidence_item_id, output_type, role_family_normalized)
+    for row in rows:
+        src = (row.get("source") or "").strip()
+        if src == "canonical_seed" and (row.get("generated_text") or "").strip() == generated_text.strip():
+            return "skip_idempotent", "already seeded"
+        if row.get("user_approved") or row.get("is_preferred") or src == "user_saved":
+            return "skip_protected", "user-approved or preferred wording exists"
+        if src == "canonical_seed":
+            return "skip_idempotent", "canonical seed already present"
+        return "skip_protected", "existing verbal output present"
+    return "insert", ""
+
+
+def upsert_verbal_output(
+    evidence_item_id,
+    output_type,
+    generated_text,
+    role_family="",
+    job_analysis_id=None,
+    user_approved=False,
+    user_feedback="",
+    role_family_normalized="",
+    is_preferred=False,
+    source="user_saved",
+    feedback_tags="",
+    feedback_note="",
+):
+    """Insert or update user-saved verbal output for evidence + type + role family."""
+    if not role_family_normalized and role_family:
+        import role_family_vocab as rfv
+        rf_norm = rfv.normalize_role_family_key(role_family)
+    else:
+        rf_norm = role_family_normalized or ""
+    existing = get_verbal_output_for_role(
+        evidence_item_id, output_type, role_family, role_family_normalized=rf_norm,
+    )
+    if existing and (existing.get("source") or "") != "generated":
+        update_verbal_output(existing["id"], {
+            "generated_text": generated_text,
+            "user_approved": user_approved,
+            "user_feedback": user_feedback,
+            "is_preferred": is_preferred,
+            "source": source,
+            "feedback_tags": feedback_tags,
+            "feedback_note": feedback_note,
+            "role_family": role_family,
+            "role_family_normalized": rf_norm,
+        })
+        return existing["id"]
+    return insert_verbal_output(
+        evidence_item_id, output_type, generated_text,
+        role_family=role_family,
+        role_family_normalized=rf_norm,
+        job_analysis_id=job_analysis_id,
+        user_approved=user_approved,
+        is_preferred=is_preferred,
+        source=source,
+        user_feedback=user_feedback,
+        feedback_tags=feedback_tags,
+        feedback_note=feedback_note,
+    )
+
+
+def count_verbal_outputs(evidence_item_id, output_type=None):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    if output_type:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM evidence_verbal_outputs WHERE evidence_item_id = ? AND output_type = ?",
+            (int(evidence_item_id), output_type),
+        )
+    else:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM evidence_verbal_outputs WHERE evidence_item_id = ?",
+            (int(evidence_item_id),),
+        )
+    row = cur.fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# User vocabulary (v3.3) — custom categories, tags, skill suggestions
+# ---------------------------------------------------------------------------
+
+def add_user_vocabulary(vocab_type, value, norm_key):
+    """Insert a custom vocabulary item. Returns id (existing if norm_key duplicate)."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM user_vocabulary WHERE vocab_type = ? AND norm_key = ?",
+        (vocab_type, norm_key),
+    )
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row["id"]
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur.execute(
+        """
+        INSERT INTO user_vocabulary (vocab_type, value, norm_key, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (vocab_type, value, norm_key, now, now),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def get_user_vocabulary(vocab_type=None):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    if vocab_type:
+        cur.execute(
+            "SELECT * FROM user_vocabulary WHERE vocab_type = ? ORDER BY value COLLATE NOCASE",
+            (vocab_type,),
+        )
+    else:
+        cur.execute("SELECT * FROM user_vocabulary ORDER BY vocab_type, value COLLATE NOCASE")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_user_vocabulary_by_id(vocab_id):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM user_vocabulary WHERE id = ?", (int(vocab_id),))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user_vocabulary_by_key(vocab_type, norm_key):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM user_vocabulary WHERE vocab_type = ? AND norm_key = ?",
+        (vocab_type, norm_key),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_user_vocabulary(vocab_id, value, norm_key):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur.execute(
+        "UPDATE user_vocabulary SET value = ?, norm_key = ?, updated_at = ? WHERE id = ?",
+        (value, norm_key, now, int(vocab_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_user_vocabulary(vocab_id):
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM user_vocabulary WHERE id = ?", (int(vocab_id),))
+    conn.commit()
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Preference feedback (v3) — transparent, bounded personalization
 # ---------------------------------------------------------------------------
@@ -798,6 +1338,150 @@ def get_preference_feedback(scope=None):
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Translation feedback (v3.2) — bullet actions + preferred wording
+# ---------------------------------------------------------------------------
+
+def save_translation_feedback(
+    resume_version_id=None,
+    analysis_id=None,
+    evidence_item_id=None,
+    role_family="",
+    source_text="",
+    generated_text="",
+    final_text=None,
+    action_type="keep",
+    feedback_tags=None,
+    notes="",
+    bullet_index=None,
+):
+    """Persist a bullet-level or resume-level translation feedback row."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    tags = feedback_tags
+    if isinstance(tags, (list, tuple)):
+        tags = ", ".join(str(t) for t in tags if t)
+    cur.execute(
+        """
+        INSERT INTO translation_feedback (
+            resume_version_id, analysis_id, evidence_item_id, role_family,
+            source_text, generated_text, final_text, action_type,
+            feedback_tags, notes, bullet_index, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            resume_version_id,
+            analysis_id,
+            evidence_item_id,
+            str(role_family or ""),
+            source_text or "",
+            generated_text or "",
+            final_text,
+            action_type,
+            tags or "",
+            notes or "",
+            bullet_index,
+            now,
+        ),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def get_translation_feedback(
+    resume_version_id=None,
+    role_family=None,
+    action_type=None,
+    limit=50,
+):
+    """Return translation feedback rows, newest first."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    clauses = []
+    params = []
+    if resume_version_id is not None:
+        clauses.append("resume_version_id = ?")
+        params.append(int(resume_version_id))
+    if role_family:
+        clauses.append("role_family = ?")
+        params.append(role_family)
+    if action_type:
+        clauses.append("action_type = ?")
+        params.append(action_type)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cur.execute(
+        f"SELECT * FROM translation_feedback {where} ORDER BY id DESC LIMIT ?",
+        params + [int(limit)],
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_preferred_wording(role_family, limit=10):
+    """Retrieve approved/preferred phrasing for style guidance (not model training)."""
+    preferred = get_translation_feedback(role_family=role_family, action_type="preferred", limit=limit)
+    edited = get_translation_feedback(role_family=role_family, action_type="edited", limit=limit)
+    seen = set()
+    out = []
+    for row in preferred + edited:
+        text = row.get("final_text") or row.get("generated_text") or ""
+        if text and text not in seen:
+            seen.add(text)
+            out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def get_avoid_feedback_tags(role_family):
+    """Tags from resume-level reviews to avoid in future wording."""
+    init_db()
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT feedback_tags FROM translation_feedback
+        WHERE role_family = ? AND action_type = 'resume_review'
+        ORDER BY id DESC LIMIT 20
+        """,
+        (role_family,),
+    )
+    avoid = {"Overclaims experience", "Too generic"}
+    for row in cur.fetchall():
+        for tag in (row["feedback_tags"] or "").split(","):
+            t = tag.strip()
+            if t in ("Overclaims experience", "Too generic", "Poor wording / not how I would say it"):
+                avoid.add(t)
+    conn.close()
+    return sorted(avoid)
+
+
+def save_resume_review_feedback(
+    resume_version_id,
+    usefulness,
+    feedback_tags=None,
+    notes="",
+    analysis_id=None,
+    role_family="",
+):
+    """Persist resume-level review (usefulness + optional tags)."""
+    return save_translation_feedback(
+        resume_version_id=resume_version_id,
+        analysis_id=analysis_id,
+        role_family=role_family,
+        action_type="resume_review",
+        feedback_tags=feedback_tags,
+        notes=notes,
+        source_text=usefulness,
+    )
 
 
 if __name__ == "__main__":

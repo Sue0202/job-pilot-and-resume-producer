@@ -567,11 +567,12 @@ def build_translation_cards(profile_text, jd_text, result, evidence_items=None):
 
     # Evidence library items with stored translations.
     for item in evidence_items:
-        bullet = (item.get("bullet_draft") or item.get("action") or item.get("title") or "").strip()
+        facts = (item.get("factual_context") or item.get("action") or item.get("title") or "").strip()
+        bullet = (item.get("bullet_draft") or facts).strip()
         if not bullet:
             continue
         translations = (item.get("target_role_translations") or "").strip()
-        original = (item.get("original_industry_context") or item.get("role_context") or "").strip()
+        original = facts or (item.get("original_industry_context") or item.get("role_context") or "").strip()
         tags = [t.strip() for t in (item.get("capability_tags") or item.get("tags") or "").split(",") if t.strip()]
         strength = item.get("proof_strength") or "Transferable"
         cap_label = CAPABILITY_DIRECT if strength == "Direct" else CAPABILITY_TRANSFERABLE

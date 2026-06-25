@@ -20,9 +20,15 @@ import analytics
 import database as db
 import docx_export
 import experience_translation as xt
+import evidence_edit_state as ees
+import evidence_verbal as ev
+import evidence_vocabulary as evocab
+import role_family_vocab as rfv
+import verbal_retrieval as vr
 import jd_analyzer
 import matching
 import resume_generator as rg
+import resume_review as rr
 import test_personas
 
 BASE_DIR = Path(__file__).parent
@@ -983,6 +989,10 @@ def _render_strengthen_your_case(profile_text, inputs, result, base_score, trans
             "Only add real experience you have not recorded yet. Do not create new experience "
             "to fit the JD."
         )
+        st.caption(
+            "After generating a resume, you can also **Add missing experience** from "
+            "**Light review & translation feedback** on the tailored resume section."
+        )
         _render_evidence_reanalysis(profile_text, inputs, result, base_score)
 
 
@@ -1407,6 +1417,257 @@ RESUME_FEEDBACK_PRESETS = [
 ]
 
 
+def _apply_style_guidance_to_feedback(fb, role_family):
+    """Append preferred wording hints — style guidance only, not score weights."""
+    if not role_family:
+        return fb
+    preferred = db.get_preferred_wording(role_family)
+    avoid = db.get_avoid_feedback_tags(role_family)
+    snippet = rr.style_guidance_snippet(preferred, avoid)
+    if snippet:
+        return (fb + "; " + snippet) if fb else snippet
+    return fb
+
+
+def _persist_bullet_feedback(bullet_states, resume_version_id, analysis_id, role_family, review_tags=None):
+    """Batch-persist edited/excluded bullet actions tied to a saved resume version."""
+    for b in bullet_states:
+        action = b.get("action", rr.BULLET_ACTION_KEEP)
+        if action == rr.BULLET_ACTION_KEEP:
+            continue
+        db.save_translation_feedback(
+            resume_version_id=resume_version_id,
+            analysis_id=analysis_id,
+            evidence_item_id=b.get("evidence_item_id"),
+            role_family=role_family,
+            source_text=b.get("generated_text", ""),
+            generated_text=b.get("generated_text", ""),
+            final_text=b.get("final_text"),
+            action_type=action,
+            feedback_tags=review_tags,
+            bullet_index=b.get("index"),
+        )
+
+
+def _render_add_missing_bullet(job_id, role_family, bullet_states, resume_data, data_key):
+    """Section CTA: recall context and propose a draft bullet (never auto-saved)."""
+    st.markdown("**Add missing experience**")
+    st.caption(
+        "Recall an example not in your library, or add another bullet from your background. "
+        "Draft bullets are never auto-saved to the Evidence Library."
+    )
+    raw = st.text_area(
+        "Describe factual context (what you did, scope, outcome — no fabrication)",
+        key=f"recall_ctx_{job_id}",
+        height=100,
+        placeholder="e.g. Led cross-team rollout of a vendor ticketing integration for live ops…",
+    )
+    if st.button("Propose resume bullet", key=f"propose_bullet_{job_id}"):
+        if raw.strip():
+            evidence_items = db.get_evidence_items()
+            kind, ev_id = rr.classify_recalled_context(raw, evidence_items)
+            draft = rr.propose_bullet(raw, role_family)
+            st.session_state[f"recalled_draft_{job_id}"] = {
+                "raw": raw.strip(),
+                "draft": draft,
+                "kind": kind,
+                "evidence_id": ev_id,
+            }
+        else:
+            st.warning("Enter factual context first.")
+
+    recalled = st.session_state.get(f"recalled_draft_{job_id}")
+    if not recalled:
+        return
+
+    kind = recalled.get("kind")
+    if kind == "existing_evidence":
+        st.info(
+            f"This resembles existing Evidence Library item #{recalled.get('evidence_id')}. "
+            "Consider using that verified item instead of duplicating."
+        )
+    elif kind == "new":
+        st.warning(
+            "**Draft from recalled context — not yet verified or saved to Evidence Library.**"
+        )
+    else:
+        st.warning(
+            "**Draft from recalled context — not yet verified or saved to Evidence Library.**"
+        )
+
+    edited_draft = st.text_area(
+        "Proposed bullet (editable)",
+        value=recalled.get("draft", ""),
+        key=f"recalled_draft_edit_{job_id}",
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Use for this resume only", key=f"recall_use_{job_id}"):
+            bullets = list(bullet_states)
+            new_idx = len(bullets)
+            bullets.append({
+                "id": f"recall_{new_idx}",
+                "index": new_idx,
+                "block_header": ["Recalled context (this resume only)"],
+                "section": "Recalled context (this resume only)",
+                "generated_text": edited_draft.strip(),
+                "final_text": edited_draft.strip(),
+                "action": rr.BULLET_ACTION_KEEP,
+                "excluded": False,
+                "evidence_item_id": None,
+                "recalled": True,
+            })
+            st.session_state[f"resume_bullets_{job_id}"] = bullets
+            resume_data = dict(resume_data)
+            resume_data["full_resume_text"] = rr.rebuild_full_resume_text(resume_data, bullets)
+            st.session_state[data_key] = resume_data
+            st.session_state.pop(f"recalled_draft_{job_id}", None)
+            st.success("Added to this resume only — not saved to Evidence Library.")
+            st.rerun()
+    with c2:
+        if st.button("Save to Evidence Library as Draft", key=f"recall_draft_{job_id}"):
+            nid = db.save_evidence_item({
+                "title": recalled["raw"][:60],
+                "company": "",
+                "role_context": "Recalled from resume review",
+                "category": "Recalled",
+                "action": recalled["raw"],
+                "outcome": "",
+                "raw_notes": recalled["raw"],
+                "bullet_draft": edited_draft.strip(),
+                "status": "Draft",
+                "tags": "",
+            })
+            st.success(f"Saved as Draft evidence (id {nid}). Not used in resume until verified.")
+    with c3:
+        if st.button("Save to Evidence Library as Verified", key=f"recall_verified_{job_id}", type="primary"):
+            nid = db.save_evidence_item({
+                "title": recalled["raw"][:60],
+                "company": "",
+                "role_context": "Recalled from resume review",
+                "category": "Recalled",
+                "action": recalled["raw"],
+                "outcome": "",
+                "raw_notes": recalled["raw"],
+                "bullet_draft": edited_draft.strip(),
+                "status": "Verified",
+                "tags": "",
+            })
+            st.success(f"Saved as Verified evidence (id {nid}). Available for future resumes.")
+
+
+def _render_resume_review(
+    job_id, resume_data, data_key, job_row, result, angle, decision, score,
+    job_analysis_id,
+):
+    """Compact post-generation review: resume-level feedback + per-bullet actions."""
+    bullets_key = f"resume_bullets_{job_id}"
+    if bullets_key not in st.session_state:
+        st.session_state[bullets_key] = rr.parse_bullets(resume_data)
+    bullet_states = st.session_state[bullets_key]
+    role_family = angle or resume_data.get("target_title", "")
+
+    display_text = rr.rebuild_full_resume_text(resume_data, bullet_states)
+    st.text_area(
+        "Generated Resume",
+        value=display_text,
+        height=400,
+        key=f"resume_text_{job_id}",
+    )
+    st.caption("✓ Generated from verified material only — no fabricated experience.")
+
+    with st.expander("Light review & translation feedback", expanded=False):
+        st.caption(
+            "Optional, behavior-driven feedback — no per-bullet rating form. "
+            "Your choices guide future wording style; they do not change fit scores or your profile."
+        )
+        usefulness = st.radio(
+            "Overall usefulness",
+            rr.RESUME_USEFULNESS_OPTIONS,
+            index=None,
+            horizontal=True,
+            key=f"review_usefulness_{job_id}",
+        )
+        review_tags = st.multiselect(
+            "Feedback reasons (optional)",
+            rr.REVIEW_FEEDBACK_TAGS,
+            key=f"review_tags_{job_id}",
+        )
+        review_notes = st.text_area(
+            "Notes (optional)",
+            key=f"review_notes_{job_id}",
+            height=60,
+        )
+
+        st.markdown("**Bullets**")
+        for b in bullet_states:
+            if b.get("excluded") or b.get("action") == rr.BULLET_ACTION_EXCLUDED:
+                continue
+            bid = b["id"]
+            label = (b.get("final_text") or b.get("generated_text", ""))[:120]
+            if b.get("recalled"):
+                label = "📝 " + label
+            with st.container(border=True):
+                st.markdown(f"• {label}{'…' if len(b.get('final_text','')) > 120 else ''}")
+                if b.get("action") == rr.BULLET_ACTION_EDITED:
+                    st.caption("Edited")
+                edit_key = f"edit_mode_{job_id}_{bid}"
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    if st.button("Edit", key=f"btn_edit_{job_id}_{bid}"):
+                        st.session_state[edit_key] = True
+                with c2:
+                    if st.button("Exclude", key=f"btn_excl_{job_id}_{bid}"):
+                        b["excluded"] = True
+                        b["action"] = rr.BULLET_ACTION_EXCLUDED
+                        st.session_state[bullets_key] = bullet_states
+                        updated = dict(resume_data)
+                        updated["full_resume_text"] = rr.rebuild_full_resume_text(updated, bullet_states)
+                        st.session_state[data_key] = updated
+                        st.rerun()
+                with c3:
+                    if st.button("Save as preferred wording", key=f"btn_pref_{job_id}_{bid}"):
+                        text = b.get("final_text") or b.get("generated_text", "")
+                        db.save_translation_feedback(
+                            role_family=role_family,
+                            source_text=b.get("generated_text", ""),
+                            generated_text=b.get("generated_text", ""),
+                            final_text=text,
+                            action_type=rr.BULLET_ACTION_PREFERRED,
+                            analysis_id=job_analysis_id,
+                        )
+                        st.success("Saved as preferred wording for future style guidance.")
+
+                if st.session_state.get(edit_key):
+                    new_text = st.text_area(
+                        "Edit bullet",
+                        value=b.get("final_text") or b.get("generated_text", ""),
+                        key=f"edit_area_{job_id}_{bid}",
+                    )
+                    if st.button("Save edit", key=f"save_edit_{job_id}_{bid}"):
+                        b["final_text"] = new_text.strip()
+                        b["action"] = rr.BULLET_ACTION_EDITED
+                        st.session_state[edit_key] = False
+                        st.session_state[bullets_key] = bullet_states
+                        updated = dict(resume_data)
+                        updated["full_resume_text"] = rr.rebuild_full_resume_text(updated, bullet_states)
+                        st.session_state[data_key] = updated
+                        st.rerun()
+
+        _render_add_missing_bullet(job_id, role_family, bullet_states, resume_data, data_key)
+
+        if usefulness and st.button("Save review feedback", key=f"save_review_{job_id}"):
+            st.session_state[f"review_saved_{job_id}"] = {
+                "usefulness": usefulness,
+                "tags": review_tags,
+                "notes": review_notes,
+            }
+            st.success("Review feedback saved locally — will persist when you save the resume version.")
+
+    saved_review = st.session_state.get(f"review_saved_{job_id}", {})
+    return bullet_states, display_text, saved_review
+
+
 def _render_resume_section(profile_text, job_row, angle="", decision="", score=None,
                            job_analysis_id=None, translation_cards=None, tailoring_plan=None):
     """Match the selected job, then generate / download / save a tailored resume.
@@ -1482,7 +1743,7 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
     fb_key = f"resume_feedback_{job_id}"
     if gen_clicked or regen_clicked:
         # Combine verified profile + evidence + approved translations (never temp evidence).
-        material = profile_text + _evidence_to_material(chosen_ev)
+        material = profile_text + _evidence_to_material(chosen_ev, role_family=angle or "")
         material += xt.approved_mappings_to_material(approved_cards)
         fb_parts = list(fb_presets)
         if angle:
@@ -1492,12 +1753,15 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
         if regen_clicked and feedback_text.strip():
             fb_parts.append(feedback_text.strip())
         fb = "; ".join(fb_parts)
+        fb = _apply_style_guidance_to_feedback(fb, angle or "")
         st.session_state[data_key] = rg.generate_resume(material, job_row, result, fb)
         st.session_state[fb_key] = fb
         st.session_state[f"resume_ev_used_{job_id}"] = [e["id"] for e in chosen_ev]
         st.session_state[f"resume_maps_used_{job_id}"] = [
             c["mapping_id"] for c in approved_cards
         ]
+        st.session_state.pop(f"resume_bullets_{job_id}", None)
+        st.session_state.pop(f"review_saved_{job_id}", None)
         if angle:
             st.session_state[data_key]["target_title"] = angle
 
@@ -1506,26 +1770,26 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
         st.info("Click **Generate Resume** to build a tailored resume from this match.")
         return
 
-    st.text_area(
-        "Generated Resume",
-        value=resume_data["full_resume_text"],
-        height=500,
-        key=f"resume_text_{job_id}",
+    bullet_states, display_text, saved_review = _render_resume_review(
+        job_id, resume_data, data_key, job_row, result, angle, decision, score,
+        job_analysis_id,
     )
-    st.caption("✓ Generated from verified material only — no fabricated experience.")
 
     cold1, cold2, cold3 = st.columns(3)
     with cold1:
         st.download_button(
             "Download TXT",
-            data=resume_data["full_resume_text"].encode("utf-8"),
+            data=display_text.encode("utf-8"),
             file_name=f"resume_{job_id}.txt",
             mime="text/plain",
             key=f"txt_{job_id}",
         )
     with cold2:
         try:
-            docx_bytes = docx_export.create_resume_docx(resume_data)
+            dl_data = dict(resume_data)
+            dl_data["full_resume_text"] = display_text
+            dl_data["professional_experience"] = rr.rebuild_experience_text(bullet_states)
+            docx_bytes = docx_export.create_resume_docx(dl_data)
             st.download_button(
                 "Download DOCX",
                 data=docx_bytes,
@@ -1537,6 +1801,11 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
             st.error(f"DOCX export failed: {exc}")
     with cold3:
         if st.button("Save Generated Version", type="primary", key=f"save_{job_id}"):
+            review = st.session_state.get(f"review_saved_{job_id}", {})
+            usefulness = review.get("usefulness") or st.session_state.get(f"review_usefulness_{job_id}")
+            review_tags = review.get("tags") or st.session_state.get(f"review_tags_{job_id}", [])
+            review_notes = review.get("notes") or st.session_state.get(f"review_notes_{job_id}", "")
+            tags_str = ", ".join(review_tags) if review_tags else ""
             new_id = db.save_resume_version(
                 company=job_row.get("company", ""),
                 job_title=job_row.get("job_title", ""),
@@ -1546,13 +1815,27 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
                 matched_keywords=", ".join(result.get("matched_keywords", []) or []),
                 missing_keywords=", ".join(result.get("missing_keywords", []) or []),
                 feedback_text=st.session_state.get(fb_key, ""),
-                resume_text=resume_data.get("full_resume_text", ""),
+                resume_text=display_text,
                 jd_snapshot=(job_row.get("description", "") or "")[:2000],
                 selected_angle=angle or resume_data.get("target_title", ""),
                 decision_at_generation=decision,
                 score_at_generation=score,
                 evidence_used_json=json.dumps(st.session_state.get(f"resume_ev_used_{job_id}", [])),
                 job_analysis_id=job_analysis_id,
+                review_usefulness=usefulness or "",
+                review_tags=tags_str,
+                review_notes=review_notes or "",
+                bullet_state_json=rr.bullets_to_state_json(bullet_states),
+            )
+            if usefulness:
+                db.save_resume_review_feedback(
+                    new_id, usefulness, feedback_tags=review_tags,
+                    notes=review_notes, analysis_id=job_analysis_id,
+                    role_family=angle or resume_data.get("target_title", ""),
+                )
+            _persist_bullet_feedback(
+                bullet_states, new_id, job_analysis_id,
+                angle or resume_data.get("target_title", ""), review_tags=review_tags,
             )
             st.success(f"Saved as a new resume version (id {new_id}). Earlier versions are kept.")
 
@@ -1900,27 +2183,311 @@ def _flash(message):
 # Evidence Library (v3)
 # ---------------------------------------------------------------------------
 
-EVIDENCE_CATEGORIES = [
-    "Launch / Release", "Program Management", "Analytics", "Support Operations",
-    "Platform Operations", "Creator Operations", "Stakeholder Management",
-    "Process Improvement", "Other",
-]
-EVIDENCE_TAG_OPTIONS = xt.FILTER_TAGS
-EVIDENCE_STATUSES = ["Draft", "Verified", "Archived"]
-PROOF_STRENGTH_OPTIONS = xt.PROOF_STRENGTHS
+
+def _render_manage_vocabulary():
+    with st.expander("Manage my vocabulary", expanded=False):
+        st.caption(
+            "Review custom categories, tags, and skill suggestions. System defaults cannot "
+            "be edited or deleted."
+        )
+        for vocab_type, label in [
+            (evocab.VOCAB_CATEGORY, "Custom categories"),
+            (evocab.VOCAB_CAPABILITY_TAG, "Custom capability tags"),
+            (evocab.VOCAB_SKILL_TOOL, "Custom skills / tools"),
+            (rfv.VOCAB_ROLE_FAMILY, "Custom role families"),
+        ]:
+            if vocab_type == rfv.VOCAB_ROLE_FAMILY:
+                custom = rfv.custom_role_families_only()
+            else:
+                custom = evocab.custom_vocabulary_only(vocab_type)
+            if not custom:
+                continue
+            st.markdown(f"**{label}**")
+            for row in custom:
+                if vocab_type == rfv.VOCAB_ROLE_FAMILY:
+                    used = rfv.count_role_family_usage(row["value"])
+                else:
+                    used = evocab.count_vocabulary_usage(vocab_type, row["value"])
+                c1, c2, c3 = st.columns([3, 1, 1])
+                with c1:
+                    st.text(f"{row['value']}  ({used} in use)")
+                with c2:
+                    new_name = st.text_input(
+                        "Rename",
+                        value=row["value"],
+                        key=f"rename_{vocab_type}_{row['id']}",
+                        label_visibility="collapsed",
+                    )
+                    if st.button("Rename", key=f"do_rename_{row['id']}"):
+                        if vocab_type == rfv.VOCAB_ROLE_FAMILY:
+                            ok, msg = rfv.rename_custom_role_family(row["id"], new_name)
+                        else:
+                            ok, msg = evocab.rename_custom_vocabulary(row["id"], new_name)
+                        if ok:
+                            _flash_evidence(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
+                with c3:
+                    if st.button("Delete", key=f"del_{row['id']}"):
+                        if vocab_type == rfv.VOCAB_ROLE_FAMILY:
+                            ok, msg = rfv.delete_custom_role_family(row["id"])
+                        else:
+                            ok, msg = evocab.delete_custom_vocabulary(row["id"])
+                        if ok:
+                            _flash_evidence(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
+        # Optional merge for tags
+        tag_rows = evocab.custom_vocabulary_only(evocab.VOCAB_CAPABILITY_TAG)
+        if len(tag_rows) >= 2:
+            st.markdown("**Merge capability tags**")
+            ids = [r["id"] for r in tag_rows]
+            labels = {r["id"]: r["value"] for r in tag_rows}
+            m1, m2, m3 = st.columns([2, 2, 1])
+            with m1:
+                from_id = st.selectbox("Merge from", ids, format_func=lambda i: labels[i], key="merge_from")
+            with m2:
+                to_id = st.selectbox("Into", ids, format_func=lambda i: labels[i], key="merge_to")
+            with m3:
+                if st.button("Merge", key="do_merge"):
+                    if from_id == to_id:
+                        st.warning("Pick two different tags.")
+                    else:
+                        ok, msg = evocab.merge_custom_vocabulary(from_id, to_id)
+                        if ok:
+                            _flash_evidence(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
 
 
-def _evidence_to_material(items):
+def _evidence_factual(item):
+    """Primary factual source text for an evidence item."""
+    return (
+        (item.get("factual_context") or "").strip()
+        or (item.get("action") or "").strip()
+        or (item.get("original_industry_context") or "").strip()
+    )
+
+
+def _evidence_impact(item):
+    return (item.get("impact_outcome") or item.get("outcome") or "").strip()
+
+
+def _build_quick_capture_record(
+    title, company, role_context, time_period, factual, impact,
+    skills, category, cap_tags_str, raw_notes, status,
+):
+    """Build evidence dict for save — status is explicit from submit button."""
+    category = evocab.ensure_category(category) if category else ""
+    cap_tags = evocab.ensure_capability_tags(evocab.parse_comma_tags(cap_tags_str))
+    if skills:
+        evocab.register_skills_from_text(skills)
+    tags_joined = ", ".join(cap_tags)
+    return {
+        "title": title.strip(),
+        "company": company.strip(),
+        "role_context": role_context.strip(),
+        "time_period": time_period.strip(),
+        "factual_context": factual.strip(),
+        "impact_outcome": impact.strip(),
+        "skills": skills.strip(),
+        "category": category,
+        "capability_tags": tags_joined,
+        "tags": tags_joined,
+        "raw_notes": raw_notes.strip(),
+        "status": status,
+        "action": factual.strip()[:2000],
+        "outcome": impact.strip(),
+    }
+
+
+def _render_verbal_outputs_section(
+    item,
+    *,
+    edit_factual="",
+    edit_impact="",
+    edit_company="",
+    edit_role="",
+    edit_skills="",
+    edit_tags=None,
+    edit_tags_pending="",
+):
+    """Optional generated wording — never overwrites factual evidence."""
+    st.markdown("**Generated verbal outputs**")
+    st.caption(
+        "Preference memory / retrieval only — not model training. Wording saves only when "
+        "you click **Save wording**, **Mark approved**, or **Save as preferred wording**."
+    )
+    item_id = item["id"]
+    facts = (edit_factual or _evidence_factual(item)).strip()
+    impact = (edit_impact or _evidence_impact(item)).strip()
+    tags = evocab.merge_capability_tags(
+        edit_tags or [], edit_tags_pending or "", save_custom=False,
+    )
+
+    rf_options = rfv.all_role_families()
+    role_family = st.selectbox(
+        "Role family for translation",
+        rf_options,
+        key=f"verbal_rf_{item_id}",
+    )
+    new_rf = st.text_input(
+        "Or create a new role family",
+        key=f"verbal_rf_new_{item_id}",
+        placeholder="e.g. Technical Program Management",
+    )
+    if new_rf.strip():
+        role_family = rfv.ensure_role_family(new_rf.strip())
+    rf_norm = rfv.normalize_role_family_key(role_family)
+
+    output_type = st.selectbox(
+        "Output type",
+        [ev.OUTPUT_RESUME_BULLET, ev.OUTPUT_TARGET_TRANSLATION],
+        format_func=ev.verbal_output_label,
+        key=f"verbal_otype_{item_id}",
+    )
+
+    saved_for_role = db.get_verbal_outputs_for_role(item_id, role_family, rf_norm)
+    if saved_for_role:
+        st.markdown("**Saved wording for this evidence + role family**")
+        for out in saved_for_role:
+            pref = "★ preferred" if out.get("is_preferred") else ""
+            appr = "✓ approved" if out.get("user_approved") else ""
+            src = out.get("source") or "generated"
+            st.caption(
+                f"{ev.verbal_output_label(out.get('output_type', ''))} · "
+                f"{out.get('role_family') or '—'} · {src} {appr} {pref}".strip()
+            )
+            st.text(out.get("generated_text") or "")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                if st.button("Edit in draft", key=f"edit_vo_{out['id']}"):
+                    otype = out.get("output_type") or ev.OUTPUT_RESUME_BULLET
+                    st.session_state[f"verbal_otype_{item_id}"] = otype
+                    st.session_state[
+                        f"verbal_draft_{item_id}_{rf_norm}_{otype}"
+                    ] = out.get("generated_text") or ""
+                    _flash_evidence("Loaded into draft — edit and Save wording to replace.")
+            with c2:
+                if st.button("Mark preferred", key=f"pref_{out['id']}"):
+                    for other in saved_for_role:
+                        if other["id"] != out["id"] and other.get("output_type") == out.get("output_type"):
+                            db.update_verbal_output(other["id"], {"is_preferred": False})
+                    db.update_verbal_output(out["id"], {"is_preferred": True, "user_approved": True})
+                    _flash_evidence("Marked as preferred wording.")
+            with c3:
+                if st.button("Delete", key=f"del_vo_{out['id']}"):
+                    db.delete_verbal_output(out["id"])
+                    _flash_evidence("Deleted saved wording.")
+
+    draft_key = f"verbal_draft_{item_id}_{rf_norm}_{output_type}"
+    if draft_key not in st.session_state:
+        st.session_state[draft_key] = ""
+
+    fb_tags = st.multiselect(
+        "Feedback tags (optional)",
+        rfv.FEEDBACK_TAG_OPTIONS,
+        key=f"verbal_fb_tags_{item_id}",
+    )
+    fb_custom = st.text_input("Custom feedback tag (optional)", key=f"verbal_fb_custom_{item_id}")
+    fb_note = st.text_input("Feedback note (optional)", key=f"verbal_fb_note_{item_id}")
+
+    jd_snippet = st.session_state.get("analyze_jd_snippet", "")
+    g1, g2 = st.columns(2)
+    with g1:
+        if st.button("Generate new draft", key=f"gen_draft_{item_id}"):
+            if output_type == ev.OUTPUT_RESUME_BULLET:
+                text, err = ev.generate_resume_bullet(
+                    facts, impact, edit_company, edit_role, edit_skills, tags, role_family,
+                )
+            else:
+                text, err = ev.generate_target_translation(
+                    facts, role_family, jd_snippet, impact_outcome=impact, capability_tags=tags,
+                )
+            if err:
+                st.session_state[f"verbal_err_{item_id}"] = err
+            else:
+                st.session_state[draft_key] = text
+                st.session_state.pop(f"verbal_err_{item_id}", None)
+    with g2:
+        st.caption("New drafts stay transient until you explicitly save.")
+
+    if st.session_state.get(f"verbal_err_{item_id}"):
+        st.warning(st.session_state[f"verbal_err_{item_id}"])
+
+    st.text_area(
+        f"New generated draft — {ev.verbal_output_label(output_type)}",
+        height=100,
+        key=draft_key,
+    )
+
+    tag_str = ", ".join(fb_tags + ([fb_custom.strip()] if fb_custom.strip() else []))
+
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        if st.button("Save wording", key=f"save_wording_{item_id}", use_container_width=True):
+            db.upsert_verbal_output(
+                item_id, output_type,
+                st.session_state.get(draft_key, ""),
+                role_family=role_family,
+                role_family_normalized=rf_norm,
+                source="user_saved",
+                feedback_tags=tag_str,
+                feedback_note=fb_note,
+            )
+            _flash_evidence("Wording saved.")
+    with s2:
+        if st.button("Mark approved", key=f"mark_verbal_{item_id}", use_container_width=True):
+            db.upsert_verbal_output(
+                item_id, output_type,
+                st.session_state.get(draft_key, ""),
+                role_family=role_family,
+                role_family_normalized=rf_norm,
+                user_approved=True,
+                source="user_saved",
+                feedback_tags=tag_str,
+                feedback_note=fb_note,
+            )
+            _flash_evidence("Marked approved.")
+    with s3:
+        if st.button("Save as preferred wording", key=f"save_pref_{item_id}", use_container_width=True):
+            for other in db.get_verbal_outputs_by_slot(item_id, output_type, rf_norm):
+                db.update_verbal_output(other["id"], {"is_preferred": False})
+            db.upsert_verbal_output(
+                item_id, output_type,
+                st.session_state.get(draft_key, ""),
+                role_family=role_family,
+                role_family_normalized=rf_norm,
+                user_approved=True,
+                is_preferred=True,
+                source="user_saved",
+                feedback_tags=tag_str,
+                feedback_note=fb_note,
+            )
+            _flash_evidence("Saved as preferred wording for this evidence + role family.")
+
+
+def _evidence_to_material(items, role_family=""):
     """Render verified evidence items as resume-ready text appended to the profile."""
     if not items:
         return ""
     lines = ["\n\n## Verified Evidence Library (approved by candidate)\n"]
     for e in items:
-        bullet = (e.get("bullet_draft") or "").strip()
+        bullet = vr.preferred_resume_bullet(e, role_family=role_family)
         if not bullet:
-            # Compose a plain, truthful line from structured fields (no fabrication).
-            parts = [p for p in [e.get("action", ""), e.get("outcome", "")] if p]
-            bullet = " — ".join(parts) if parts else (e.get("title", "") or "")
+            bullet = (e.get("bullet_draft") or "").strip()
+        if not bullet:
+            bullet, _ = ev.generate_resume_bullet(
+                _evidence_factual(e), _evidence_impact(e),
+                e.get("company", ""), e.get("role_context", ""), e.get("skills", ""),
+                [t.strip() for t in (e.get("capability_tags") or e.get("tags") or "").split(",") if t.strip()],
+                role_family=role_family,
+            )
+        if not bullet:
+            bullet = e.get("title", "") or ""
         context = " ".join(p for p in [e.get("company", ""), e.get("role_context", "")] if p)
         lines.append(f"- {bullet}" + (f" ({context})" if context else ""))
     return "\n".join(lines)
@@ -1929,10 +2496,13 @@ def _evidence_to_material(items):
 def page_evidence_library():
     st.header("Evidence Library")
     st.caption(
-        "Your verified, reusable experience evidence. Only **Verified** items are eligible "
-        "for resume generation. Temporary re-analysis notes are never saved here "
-        "automatically — you must explicitly save them."
+        "Capture factual experience quickly. Only **Verified** items are eligible for resume "
+        "generation. JD-specific translation happens during **Analyze Job**, not here."
     )
+
+    if not st.session_state.get("evidence_backfill_done"):
+        db.backfill_evidence_factual_fields()
+        st.session_state["evidence_backfill_done"] = True
 
     pending = st.session_state.pop("evidence_flash", None)
     if pending:
@@ -1940,7 +2510,6 @@ def page_evidence_library():
 
     items = db.get_evidence_items()
 
-    # ---- Summary ----------------------------------------------------------
     def _count(status):
         return sum(1 for e in items if (e.get("status") or "") == status)
 
@@ -1950,66 +2519,105 @@ def page_evidence_library():
     m[2].metric("Verified", _count("Verified"))
     m[3].metric("Archived", _count("Archived"))
 
-    # ---- Add new evidence -------------------------------------------------
-    with st.expander("Add evidence item", expanded=not items):
-        with st.form("add_evidence"):
-            title = st.text_input("Title")
+    # ---- Quick Capture ----------------------------------------------------
+    with st.expander("Quick capture", expanded=not items):
+        st.caption("Capture experience in under 2 minutes. Write facts only — optimize wording later.")
+        with st.form("quick_capture_evidence", clear_on_submit=True):
+            title = st.text_input("Title *")
             c1, c2 = st.columns(2)
             with c1:
-                company = st.text_input("Company / project")
-                time_period = st.text_input("Date / time period")
-                category = st.selectbox("Category", EVIDENCE_CATEGORIES)
+                company = st.text_input("Company / project *")
+                prior_co = evocab.previous_field_values("company")
+                if prior_co:
+                    st.caption("Recent: " + ", ".join(prior_co[:6]))
             with c2:
-                role_context = st.text_input("Role or context")
-                skills = st.text_input("Skills / tools (comma-separated)")
-                status = st.selectbox("Status", EVIDENCE_STATUSES, index=0)
-            original_ctx = st.text_input(
-                "Original industry context (e.g., gaming / live ops framing)"
+                role_context = st.text_input("Role / context *")
+                prior_role = evocab.previous_field_values("role_context")
+                if prior_role:
+                    st.caption("Recent: " + ", ".join(prior_role[:6]))
+            time_period = st.text_input("Date / time period (optional)")
+            factual = st.text_area(
+                "What happened? What did you own or do? *",
+                height=140,
+                placeholder="Describe scope, stakeholders, deliverables, and your ownership. Factual only.",
+                help="Write factual context only. Do not optimize wording yet.",
             )
-            target_trans = st.text_input(
-                "Target-role translation (how this reads outside gaming)"
+            st.caption("Write factual context only. Do not optimize wording yet.")
+            impact = st.text_area(
+                "What changed, improved, or became possible? (optional)",
+                height=60,
+                placeholder="Only include real, verifiable outcomes.",
             )
-            proof_strength = st.selectbox("Proof strength", PROOF_STRENGTH_OPTIONS, index=1)
-            action = st.text_area("Action taken", height=80)
-            outcome = st.text_input("Outcome / metric (only if real)")
-            bullet_draft = st.text_area("Resume-ready bullet draft (optional)", height=70)
-            cap_tags = st.multiselect("Transferable capability tags", EVIDENCE_TAG_OPTIONS)
-            raw_notes = st.text_area("Raw notes (optional)", height=70)
-            if st.form_submit_button("Save to Evidence Library", type="primary"):
-                if not title.strip() and not action.strip():
-                    st.warning("Add at least a title or an action.")
+            st.caption("Only include real outcomes you can stand behind.")
+
+            with st.expander("Optional: skills, category, tags, notes"):
+                skills = st.text_input(
+                    "Skills / tools (comma-separated)",
+                    placeholder="Jira, SQL, Workday",
+                )
+                sug = evocab.skill_suggestions()[:10]
+                if sug:
+                    st.caption("Suggestions: " + ", ".join(sug))
+                st.caption(evocab.SELECTOR_HELP)
+                cat_options = [""] + evocab.all_categories()
+                cat_pick = st.selectbox("Category", cat_options, format_func=lambda x: x or "— none —")
+                new_cat = st.text_input(
+                    "Or create a new category",
+                    placeholder="e.g. Access Governance",
+                )
+                cap_new = st.text_input(
+                    "Capability tags (comma-separated)",
+                    placeholder="Workflow Design, Launch Readiness",
+                )
+                raw_notes = st.text_area("Raw notes", height=50)
+
+            b_draft, b_verified = st.columns(2)
+            with b_draft:
+                save_draft = st.form_submit_button("Save as Draft", use_container_width=True)
+            with b_verified:
+                save_verified = st.form_submit_button(
+                    "Save as Verified", type="primary", use_container_width=True,
+                )
+
+            if save_draft or save_verified:
+                status = "Verified" if save_verified else "Draft"
+                if not title.strip():
+                    st.warning("Title is required.")
+                elif not company.strip() and not role_context.strip():
+                    st.warning("Company/project or role/context is required.")
+                elif not factual.strip():
+                    st.warning("Factual evidence is required.")
                 else:
-                    db.save_evidence_item({
-                        "title": title, "company": company, "role_context": role_context,
-                        "time_period": time_period, "category": category, "skills": skills,
-                        "action": action, "outcome": outcome, "raw_notes": raw_notes,
-                        "bullet_draft": bullet_draft, "status": status,
-                        "tags": ", ".join(cap_tags),
-                        "original_industry_context": original_ctx,
-                        "target_role_translations": target_trans,
-                        "capability_tags": ", ".join(cap_tags),
-                        "proof_strength": proof_strength,
-                    })
-                    _flash_evidence("Evidence item saved.")
+                    category = new_cat.strip() or cat_pick
+                    record = _build_quick_capture_record(
+                        title, company, role_context, time_period,
+                        factual, impact, skills, category, cap_new, raw_notes, status,
+                    )
+                    new_id = db.save_evidence_item(record)
+                    _flash_evidence(f"Saved as {status} (id {new_id}).")
+
+    _render_manage_vocabulary()
 
     if not items:
         st.info(
-            "No evidence items yet. Add your strongest, verifiable experiences here, or "
-            "recall an example from **Analyze Job → Strengthen Your Case**."
+            "No evidence items yet. Use **Quick capture** above, or recall an example from "
+            "**Analyze Job → Strengthen Your Case**."
         )
         return
 
     # ---- Filters + list ---------------------------------------------------
+    filter_cats = ["All"] + evocab.all_categories()
+    filter_tags = ["All"] + evocab.all_capability_tags()
     with st.container(border=True):
         f1, f2, f3, f4 = st.columns(4)
         with f1:
-            fstatus = st.selectbox("Status", ["All"] + EVIDENCE_STATUSES)
+            fstatus = st.selectbox("Status", ["All"] + evocab.EVIDENCE_STATUSES, key="ev_filter_status")
         with f2:
-            fcat = st.selectbox("Category", ["All"] + EVIDENCE_CATEGORIES)
+            fcat = st.selectbox("Category", filter_cats, key="ev_filter_cat")
         with f3:
-            ftag = st.selectbox("Capability tag", ["All"] + EVIDENCE_TAG_OPTIONS)
+            ftag = st.selectbox("Capability tag", filter_tags, key="ev_filter_tag")
         with f4:
-            fsearch = st.text_input("Search", placeholder="title, company, skills, tags")
+            fsearch = st.text_input("Search", placeholder="title, company, facts, tags", key="ev_filter_search")
 
     def _match(e):
         if fstatus != "All" and (e.get("status") or "") != fstatus:
@@ -2023,7 +2631,7 @@ def page_evidence_library():
         if fsearch:
             blob = " ".join(str(e.get(k, "")) for k in
                             ("title", "company", "role_context", "skills", "tags",
-                             "capability_tags", "action", "target_role_translations")).lower()
+                             "capability_tags", "factual_context", "action", "impact_outcome")).lower()
             if fsearch.lower() not in blob:
                 return False
         return True
@@ -2033,71 +2641,139 @@ def page_evidence_library():
     if filtered:
         st.dataframe(
             pd.DataFrame([
-                {"id": e["id"], "status": e.get("status", ""), "proof": e.get("proof_strength", ""),
-                 "title": e.get("title", ""), "company": e.get("company", ""),
-                 "category": e.get("category", ""), "tags": e.get("capability_tags") or e.get("tags", "")}
+                {
+                    "id": e["id"],
+                    "status": e.get("status", ""),
+                    "title": e.get("title", ""),
+                    "company": e.get("company", ""),
+                    "category": e.get("category", ""),
+                    "tags": e.get("capability_tags") or e.get("tags", ""),
+                }
                 for e in filtered
             ]),
             width="stretch", hide_index=True,
         )
 
-    # ---- Edit / review ----------------------------------------------------
+    # ---- Review / edit ----------------------------------------------------
     st.subheader("Review / edit item")
     ids = [e["id"] for e in items]
-    sel = st.selectbox("Select evidence id", options=ids)
+    sel = st.selectbox("Select evidence id", options=ids, key="ev_review_sel")
     item = db.get_evidence_item(sel)
     if item:
+        ees.apply_evidence_edit_reload(st.session_state, sel)
         with st.container(border=True):
-            st.markdown(f"**{item.get('title', '')}** — {item.get('company', '')}")
+            st.markdown(f"**{item.get('title', '')}**")
             st.caption(
-                f"Status: {item.get('status', '')} · Proof: {item.get('proof_strength', '—')} · "
-                f"Category: {item.get('category', '')}"
+                f"Status: **{item.get('status', '')}** · "
+                f"Company: {item.get('company', '—')} · Role: {item.get('role_context', '—')}"
             )
-            new_original = st.text_input(
-                "Original industry context",
-                value=item.get("original_industry_context", "") or "",
+
+            st.markdown("**1. Factual evidence**")
+            edit_factual = st.text_area(
+                "What happened?",
+                value=_evidence_factual(item),
+                height=140,
+                key=f"edit_factual_{sel}",
             )
-            new_target = st.text_input(
-                "Target-role translation",
-                value=item.get("target_role_translations", "") or "",
+            st.markdown("**2. Impact / outcome (optional)**")
+            edit_impact = st.text_area(
+                "What changed?",
+                value=_evidence_impact(item),
+                height=60,
+                key=f"edit_impact_{sel}",
             )
-            new_bullet = st.text_area(
-                "Resume-ready bullet draft",
-                value=item.get("bullet_draft", "") or "", height=80,
-            )
-            cur_strength = item.get("proof_strength") or "Transferable"
-            new_strength = st.selectbox(
-                "Proof strength", PROOF_STRENGTH_OPTIONS,
-                index=PROOF_STRENGTH_OPTIONS.index(cur_strength)
-                if cur_strength in PROOF_STRENGTH_OPTIONS else 1,
-            )
+
+            st.markdown("**3. Metadata**")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                edit_company = st.text_input("Company / project", value=item.get("company") or "", key=f"ec_{sel}")
+                edit_role = st.text_input("Role / context", value=item.get("role_context") or "", key=f"er_{sel}")
+                edit_time = st.text_input("Date / time period", value=item.get("time_period") or "", key=f"et_{sel}")
+            with mc2:
+                edit_skills = st.text_input("Skills / tools", value=item.get("skills") or "", key=f"es_{sel}")
+                cur_cat = item.get("category") or ""
+                cat_opts = evocab.all_categories(extra=[cur_cat] if cur_cat else [])
+                edit_cat = st.selectbox("Category", cat_opts, index=cat_opts.index(cur_cat) if cur_cat in cat_opts else 0, key=f"ecat_{sel}")
+                edit_cat_new = st.text_input("Or create new category", key=f"ecatnew_{sel}")
             cur_tags = [t.strip() for t in (item.get("capability_tags") or item.get("tags") or "").split(",") if t.strip()]
-            new_tags = st.multiselect("Capability tags", EVIDENCE_TAG_OPTIONS, default=cur_tags)
-            cur_status = item.get("status") or "Draft"
-            new_status = st.selectbox(
-                "Verification status", EVIDENCE_STATUSES,
-                index=EVIDENCE_STATUSES.index(cur_status) if cur_status in EVIDENCE_STATUSES else 0,
+            tag_opts = evocab.all_capability_tags(extra=cur_tags)
+            edit_tags_sel = st.multiselect(
+                "Capability tags", tag_opts,
+                default=[o for o in tag_opts if evocab.normalize_key(o) in {evocab.normalize_key(t) for t in cur_tags}],
+                key=f"etags_{sel}",
             )
-            b1, b2 = st.columns(2)
+            edit_tags_new = st.text_input(
+                "Add tags (comma-separated)",
+                key=f"etagsnew_{sel}",
+                placeholder="Onboarding, Access Governance",
+            )
+            st.caption("Type new tags above; they are applied when you click **Save changes** (Enter is not required).")
+            edit_notes = st.text_area("Raw notes", value=item.get("raw_notes") or "", height=50, key=f"enotes_{sel}")
+            cur_status = item.get("status") or "Draft"
+            edit_status = st.selectbox(
+                "Status", evocab.EVIDENCE_STATUSES,
+                index=evocab.EVIDENCE_STATUSES.index(cur_status) if cur_status in evocab.EVIDENCE_STATUSES else 0,
+                key=f"estatus_{sel}",
+            )
+
+            st.markdown("**4. Generated verbal outputs**")
+            _render_verbal_outputs_section(
+                item,
+                edit_factual=edit_factual,
+                edit_impact=edit_impact,
+                edit_company=edit_company,
+                edit_role=edit_role,
+                edit_skills=edit_skills,
+                edit_tags=edit_tags_sel,
+                edit_tags_pending=edit_tags_new,
+            )
+
+            b1, b2, b3 = st.columns(3)
             with b1:
-                if st.button("Save changes", type="primary", width="stretch"):
+                if st.button("Save changes", type="primary", use_container_width=True, key=f"save_facts_{sel}"):
+                    category = evocab.ensure_category(edit_cat_new.strip()) if edit_cat_new.strip() else edit_cat
+                    tags = evocab.merge_capability_tags(edit_tags_sel, edit_tags_new)
+                    evocab.register_skills_from_text(edit_skills)
                     db.update_evidence_item(sel, {
-                        "bullet_draft": new_bullet, "status": new_status,
-                        "original_industry_context": new_original,
-                        "target_role_translations": new_target,
-                        "proof_strength": new_strength,
-                        "capability_tags": ", ".join(new_tags),
-                        "tags": ", ".join(new_tags),
+                        "factual_context": edit_factual.strip(),
+                        "impact_outcome": edit_impact.strip(),
+                        "action": edit_factual.strip()[:2000],
+                        "outcome": edit_impact.strip(),
+                        "company": edit_company.strip(),
+                        "role_context": edit_role.strip(),
+                        "time_period": edit_time.strip(),
+                        "skills": edit_skills.strip(),
+                        "category": category,
+                        "capability_tags": ", ".join(tags),
+                        "tags": ", ".join(tags),
+                        "raw_notes": edit_notes.strip(),
+                        "status": edit_status,
                     })
-                    _flash_evidence("Evidence item updated.")
+                    _flash_evidence(
+                        "Changes saved.",
+                        reload_sel=sel,
+                        saved_tags=tags,
+                        clear_tags_input=True,
+                    )
             with b2:
-                if st.button("Archive item", width="stretch"):
+                if st.button("Mark Verified", use_container_width=True, key=f"mark_ver_{sel}"):
+                    db.update_evidence_item(sel, {"status": "Verified"})
+                    _flash_evidence("Marked Verified.", reload_sel=sel)
+            with b3:
+                if st.button("Archive", use_container_width=True, key=f"arch_{sel}"):
                     db.update_evidence_item(sel, {"status": "Archived"})
-                    _flash_evidence("Evidence item archived.")
+                    _flash_evidence("Evidence item archived.", reload_sel=sel)
 
 
-def _flash_evidence(message):
+def _flash_evidence(message, *, reload_sel=None, saved_tags=None, clear_tags_input=False):
     st.session_state["evidence_flash"] = message
+    if reload_sel is not None:
+        ees.request_evidence_edit_reload(
+            st.session_state,
+            reload_sel,
+            saved_tags=saved_tags,
+            clear_tags_input=clear_tags_input,
+        )
     st.rerun()
 
 
