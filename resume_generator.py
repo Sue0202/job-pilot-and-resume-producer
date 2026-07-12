@@ -17,8 +17,8 @@ import re
 HEADER = {
     "name": "YEYI SU",
     "location": "San Francisco, California, United States",
-    "email": "portfolio.demo@example.com",
-    "phone": "(555) 555-0100",
+    "email": "Contact details omitted from public demo.",
+    "phone": "",
 }
 
 # Role family -> profile angle + target title
@@ -45,11 +45,10 @@ PROFILES = {
     "A": {
         "title": "Product Operations & Program Management",
         "profile": (
-            "MSBA candidate with a background in product operations, creator-facing "
-            "programs, and large-scale digital products. Experienced in turning user "
-            "feedback, operational signals, and data insights into product requirements, "
-            "workflow improvements, SOPs, and cross-functional execution plans. Available "
-            "for a 2026 internship starting June 2026."
+            "MSBA candidate with a background in product operations and large-scale digital "
+            "products. Experienced in turning user feedback, operational signals, and data "
+            "insights into product requirements, workflow improvements, SOPs, and "
+            "cross-functional execution plans."
         ),
         "expertise": [
             "Product Operations",
@@ -138,9 +137,7 @@ EXPERIENCE = {
         "contexts": {
             "default": (
                 "Honkai: Star Rail, a globally published, multi-platform live digital "
-                "product across iOS, Android, PC, PlayStation, and cloud platforms with "
-                "tens of millions of MAU (20M downloads within 24 hours of launch; "
-                "100M+ downloads within its first year)."
+                "product across iOS, Android, PC, PlayStation, and cloud platforms."
             ),
             "product": (
                 "Owned live product operations from launch through post-launch iteration, "
@@ -176,7 +173,7 @@ EXPERIENCE = {
                 "families": ["technical_production", "workflow_support"],
             },
             {
-                "text": "Supported external partnership and creator-facing initiatives by coordinating confidentiality and compliance workflows, breaking down R&D requirements, defining milestones, and tracking execution for marketing campaigns, creator/UGC programs, exhibitions, and Apple/Google platform collaborations.",
+                "text": "Supported external partnership initiatives by coordinating confidentiality and compliance workflows, breaking down R&D requirements, defining milestones, and tracking execution for marketing campaigns, UGC programs, exhibitions, and Apple/Google platform collaborations.",
                 "families": ["product_program"],
             },
         ],
@@ -207,7 +204,7 @@ EXPERIENCE = {
                 "families": ["platform_ops", "technical_production"],
             },
             {
-                "text": "Partnered with User Growth, data analysis, and user research teams on closed beta and customer engagement tests, using creative A/B testing, user feedback, and retention analysis to identify product improvements and support 10%+ Day-1 retention improvement during test iterations.",
+                "text": "Partnered with User Growth, data analysis, and user research teams on closed beta and customer engagement tests, using user feedback and retention analysis to identify product improvements during test iterations.",
                 "families": ["product_program"],
             },
             {
@@ -446,7 +443,9 @@ def generate_resume(candidate_profile, job_row, match_result, feedback_text=""):
     areas_of_expertise = " | ".join(profile_meta["expertise"])
     education = _build_education(keyword_tokens)
 
-    contact_line = f"{HEADER['location']} | {HEADER['email']} | {HEADER['phone']}"
+    contact_line = " | ".join(
+        p.strip() for p in (HEADER["location"], HEADER["email"], HEADER["phone"]) if p and p.strip()
+    )
 
     full_text_parts = [
         HEADER["name"],

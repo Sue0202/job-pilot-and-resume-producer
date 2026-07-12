@@ -5,6 +5,7 @@ and track applications. Run locally: pip install -r requirements.txt && streamli
 """
 
 import json
+import re
 from datetime import date
 from pathlib import Path
 
@@ -34,6 +35,9 @@ README_PATH = BASE_DIR / "README.md"
 PRODUCT_TAGLINE = "Evidence-First AI Job Search Workflow"
 PORTFOLIO_DEMO_JOB_ID = "J001"
 PORTFOLIO_DEMO_SESSION_FLAG = "_portfolio_load_demo_jd"
+RESUME_PREVIEW_ACTION = "Generate Tailored Resume Preview"
+RESUME_PREVIEW_LABEL = "Tailored Resume Preview"
+TAILORING_PLAN_ACTION = "Review Tailoring Plan"
 
 # Job dataset fallback order: processed full sample -> demo -> built-in sample.
 PROCESSED_SAMPLE_PATH = BASE_DIR / "data" / "processed" / "external_jobs_sample.csv"
@@ -186,6 +190,11 @@ def _compose_sample_jd_text(row):
         parts.append(f"\n\nResponsibilities:\n{resp}")
     if qual:
         parts.append(f"\n\nQualifications:\n{qual}")
+    if row.get("job_id") == PORTFOLIO_DEMO_JOB_ID:
+        parts.append(
+            "\n\nPreferred:\nPreferred: direct experience with B2B SaaS customer onboarding "
+            "workflows or customer-success platforms such as Salesforce or Gainsight."
+        )
     return "".join(parts).strip()
 
 
@@ -211,7 +220,7 @@ def _apply_demo_job_to_session(job_id=PORTFOLIO_DEMO_JOB_ID):
     st.session_state["aj_jd"] = _compose_sample_jd_text(row)
     st.session_state["aj_notes"] = "Portfolio demo — sample Product Operations JD."
     st.session_state["aj_source"] = "Other"
-    st.session_state["aj_angle"] = "Auto (recommended)"
+    st.session_state["aj_angle"] = "Product Operations"
     st.session_state["aj_custom_angle"] = ""
     for key in (
         "analyze_result", "analyze_inputs", "analyze_analysis_id",
@@ -222,24 +231,100 @@ def _apply_demo_job_to_session(job_id=PORTFOLIO_DEMO_JOB_ID):
     return True
 
 
+def _portfolio_meaningful_boundary_lines(lines, gap_analysis, jd_text):
+    """Presentation-only filter for tailoring-plan boundary lines (no matcher changes)."""
+    gap_analysis = gap_analysis or {}
+    jd_low = (jd_text or "").lower()
+    canonical = []
+    for g in gap_analysis.get("required_hard_gaps") or []:
+        text = (g or "").strip()
+        if text:
+            canonical.append(text.lower())
+    for g in gap_analysis.get("eligibility_constraints") or []:
+        text = (g or "").strip()
+        if text:
+            canonical.append(text.lower())
+    for g in gap_analysis.get("preferred_tool_gaps") or []:
+        if g.get("has_adjacent_workflow"):
+            continue
+        tool = (g.get("tool") or "").strip()
+        if tool:
+            canonical.append(tool.lower())
+            canonical.append(f"will not overstate: {tool}".lower())
+
+    filtered = []
+    for line in lines or []:
+        text = (line or "").strip()
+        if not text:
+            continue
+        payload = text.split(":", 1)[1].strip() if ":" in text else text
+        if len(payload) <= 1:
+            continue
+        if re.fullmatch(r"[\W_]+", payload):
+            continue
+        if len(payload) <= 2 and not re.search(
+            r"\b" + re.escape(payload.lower()) + r"\b", jd_low,
+        ):
+            continue
+        low = text.lower()
+        if canonical and not any(c in low or low in c for c in canonical):
+            continue
+        filtered.append(text)
+    return filtered
+
+
+def _normalize_boundary_core(raw):
+    """Strip repeated boundary prefixes from a raw boundary value."""
+    s = (raw or "").strip()
+    prefixes = ("will not overstate:", "required capability gap:", "truth boundary:")
+    while s:
+        low = s.lower()
+        matched = False
+        for prefix in prefixes:
+            if low.startswith(prefix):
+                s = s[len(prefix):].strip()
+                matched = True
+                break
+        if not matched:
+            break
+    return s
+
+
+def _format_truth_boundary_display(raw):
+    """Render one truth-boundary line with a single clear prefix."""
+    core = _normalize_boundary_core(raw)
+    if not core:
+        return ""
+    core_low = core.lower()
+    if core_low.startswith("no direct ") and "ownership" in core_low:
+        return f"Truth boundary: {core[0].upper() + core[1:] if core[:1].islower() else core}"
+    if "ownership" in core_low or core_low.startswith("direct "):
+        return f"Will not overstate: {core}"
+    label = core.title() if core.islower() else core
+    return f"Truth boundary: No direct {label} ownership"
+
+
 def _render_portfolio_demo_strip(*, context="home"):
-    """Recruiter-facing 3-minute demo entry point."""
+    """Recruiter-facing demo entry — loads synthetic PO sample JD from sample_jobs.csv."""
     row = _get_builtin_sample_job(PORTFOLIO_DEMO_JOB_ID)
     title = row.get("job_title", "Product Operations Intern") if row is not None else "Product Operations Intern"
     company = row.get("company", "Aurora Interactive") if row is not None else "Aurora Interactive"
     with st.container(border=True):
-        st.markdown("#### Try the core workflow in ~3 minutes")
+        st.markdown("#### Try the 60-second demo")
         st.caption(PRODUCT_TAGLINE)
         st.markdown(
-            "1. **Load a sample job** (Product Operations) · "
-            "2. **Analyze Fit** against verified evidence · "
-            "3. **Generate a tailored resume** — no fabricated experience."
+            "Load a **synthetic Product Operations** sample job, click **Analyze Fit**, "
+            "then preview resume wording grounded in verified evidence."
         )
         c1, c2 = st.columns([2, 1])
         with c1:
-            st.caption(f"Sample: **{title}** at **{company}** (`{PORTFOLIO_DEMO_JOB_ID}` from `sample_jobs.csv`).")
+            st.caption(f"Sample: **{title}** at **{company}** (built-in demo JD).")
         with c2:
-            label = "Load sample job & analyze" if context == "analyze" else "Start demo → Analyze Job"
+            label = (
+                "Try the 60-second demo"
+                if context == "home"
+                else "Load sample Product Operations JD"
+            )
             if st.button(label, type="primary", width="stretch", key=f"portfolio_demo_{context}"):
                 _apply_demo_job_to_session(PORTFOLIO_DEMO_JOB_ID)
                 if context == "home":
@@ -303,6 +388,37 @@ DECISION_BLURB = {
     "Maybe - Needs More Evidence": "Consider applying only if you can add credible evidence.",
     "Skip": "Material requirements or constraints are not currently supported.",
 }
+
+QUALITATIVE_FIT_EXPLANATION = {
+    "High Priority": (
+        "Multiple direct, verified examples align with the JD's core responsibilities."
+    ),
+    "Apply with Tailoring": (
+        "Strong transferable evidence supports applying with tailored positioning, "
+        "while direct target-domain evidence remains limited."
+    ),
+    "Apply Selectively": (
+        "Transferable systems-delivery experience is strong, but enterprise-domain gaps "
+        "remain — apply only if the role values adaptable operators."
+    ),
+    "Maybe - Needs More Evidence": (
+        "Partial alignment; add direct, verified evidence to strengthen this application."
+    ),
+    "Skip": "Low alignment with your verified profile or material requirements block a fit.",
+}
+
+
+def _qualitative_fit_explanation(result, decision):
+    """Recruiter-facing fit explanation without numeric score prefix."""
+    raw = (result.get("scoring_explanation") or "").strip()
+    if not raw:
+        return QUALITATIVE_FIT_EXPLANATION.get(decision, "")
+
+    stripped = re.sub(r"^[\d.]+\s*=\s*[^.]+\.\s*", "", raw)
+    stripped = re.sub(r"\s*Capped at [\d.]+\s+due to:\s*", " Limited by: ", stripped).strip()
+    if "Hard requirement" in stripped or "Limited by:" in stripped:
+        return stripped
+    return QUALITATIVE_FIT_EXPLANATION.get(decision, stripped or raw)
 
 # ---------------------------------------------------------------------------
 # Navigation + theme (workflow-oriented information architecture)
@@ -401,12 +517,8 @@ def _sidebar_nav():
     return st.session_state["nav_page"]
 
 
-def _decision_summary_card(result, fit_narrative=None):
-    """High-visibility decision summary used at the top of Analyze Job results.
-
-    Pure presentation: reads precomputed fields. Optional fit_narrative supplies
-    display-calibrated base fit / decision for enterprise-systems roles.
-    """
+def _decision_summary_card(result, fit_narrative=None, display_angle=None):
+    """High-visibility decision summary — qualitative only (scores deferred to expander)."""
     fn = fit_narrative or {}
     base_score = fn.get("calibrated_base_fit") if fn.get("calibrated_base_fit") is not None else result["base_score"]
     role_family = result["selected_role_family"]
@@ -421,20 +533,17 @@ def _decision_summary_card(result, fit_narrative=None):
         priority = jd_analyzer.priority_for(adjusted_score)
 
     color, icon = DECISION_STYLE.get(decision, ("#5f6368", "⚪"))
+    confidence = (result.get("confidence") or "n/a").replace(" confidence", "")
 
     with st.container(border=True):
-        top = st.columns([1, 1, 2])
-        with top[0]:
-            label = "Calibrated Fit" if fn.get("calibrated_base_fit") is not None else "Base Fit Score"
-            st.metric(label, f"{base_score} / 10")
-        with top[1]:
-            if rf_adjustment and not fn.get("display_decision"):
-                st.metric("Adjusted Score", f"{adjusted_score} / 10", delta=f"{rf_adjustment:+}")
-            elif fn.get("material_gap_risk"):
-                st.metric("Material Gap Risk", fn["material_gap_risk"])
-            else:
-                st.metric("Confidence", result.get("confidence", "").replace(" confidence", ""))
-        with top[2]:
+        left, right = st.columns([1, 2])
+        with left:
+            if fn.get("material_gap_risk"):
+                st.markdown("**Material Gap Risk**")
+                st.write(fn["material_gap_risk"])
+            st.markdown(f"**Confidence:** {confidence}")
+            st.caption(f"Role family: **{role_family}**")
+        with right:
             st.markdown(
                 f"<div style='font-size:1.25rem;font-weight:700;color:{color};'>"
                 f"{icon} {decision} &middot; {priority} Priority</div>",
@@ -442,22 +551,39 @@ def _decision_summary_card(result, fit_narrative=None):
             )
             st.write(DECISION_BLURB.get(decision, ""))
             st.caption(
-                f"Confidence: {result.get('confidence', 'n/a')} · Role family: "
-                f"{role_family} · Suggested angle: **{result['suggested_resume_angle']}**"
+                f"Suggested angle: **{display_angle or result['suggested_resume_angle']}** · "
+                "Numerical fit scores are in **Detailed fit scores & component breakdown** below."
             )
+        st.caption(_qualitative_fit_explanation(result, decision))
+    return decision, priority, adjusted_score, rf_adjustment, base_score
+
+
+def _render_decision_summary_scores(result, fit_narrative, base_score, adjusted_score, rf_adjustment):
+    """Numerical fit scores — shown only inside the detailed breakdown expander."""
+    fn = fit_narrative or {}
+    label = "Calibrated Fit" if fn.get("calibrated_base_fit") is not None else "Base Fit Score"
+    c1, c2, c3 = st.columns(3)
+    c1.metric(label, f"{base_score} / 10")
+    if rf_adjustment and not fn.get("display_decision"):
+        c2.metric("Adjusted Score", f"{adjusted_score} / 10", delta=f"{rf_adjustment:+}")
+    elif fn.get("calibrated_base_fit") is not None and fn.get("calibrated_base_fit") != result["base_score"]:
+        c2.metric("Raw base score", f"{result['base_score']} / 10")
+    else:
+        c2.metric("Priority band", fn.get("display_priority") or jd_analyzer.priority_for(base_score))
+    c3.metric("Decision", fn.get("display_decision") or jd_analyzer.decision_for(adjusted_score))
+    if fn.get("calibrated_base_fit") is not None and fn.get("calibrated_base_fit") != result["base_score"]:
+        st.caption(
+            f"Display calibration for enterprise domain gaps: raw base "
+            f"{result['base_score']} → calibrated {fn['calibrated_base_fit']} "
+            f"(component weights unchanged)."
+        )
+    elif rf_adjustment and not fn.get("display_decision"):
+        st.caption(
+            f"Calibration adjustment from prior feedback for this role family: "
+            f"{rf_adjustment:+} (base {base_score} → adjusted {adjusted_score})."
+        )
+    if result.get("scoring_explanation"):
         st.caption(result["scoring_explanation"])
-        if fn.get("calibrated_base_fit") is not None and fn.get("calibrated_base_fit") != result["base_score"]:
-            st.caption(
-                f"Display calibration for enterprise domain gaps: raw base "
-                f"{result['base_score']} → calibrated {fn['calibrated_base_fit']} "
-                f"(component weights unchanged)."
-            )
-        elif rf_adjustment and not fn.get("display_decision"):
-            st.caption(
-                f"Calibration adjustment from prior feedback for this role family: "
-                f"{rf_adjustment:+} (base {base_score} → adjusted {adjusted_score})."
-            )
-    return decision, priority, adjusted_score, rf_adjustment
 
 
 # ---------------------------------------------------------------------------
@@ -582,12 +708,13 @@ def _activity_rows(rows, cols, limit=5):
 def page_home():
     st.title("JobPilot")
     st.caption(PRODUCT_TAGLINE)
+    with st.container(border=True):
+        st.markdown(
+            "**Evidence-first job search:** organize verified career evidence, evaluate how "
+            "it transfers to a role, surface material gaps, and preview resume wording "
+            "traceable to real experience — before you apply."
+        )
     _render_portfolio_demo_strip(context="home")
-    st.write(
-        "Evaluate jobs against **verified evidence**, translate transferable experience "
-        "conservatively, and decide whether to apply **before** generating a resume — "
-        "without fabricating experience."
-    )
 
     analyses = db.get_job_analyses()
     apps = db.get_applications()
@@ -761,8 +888,8 @@ def page_analyze_job():
     inputs = st.session_state.get("analyze_inputs", {})
     if not result:
         st.info(
-            "Fill in the job description and click **Analyze Fit**, or use **Load sample job "
-            "& analyze** above for a quick recruiter demo."
+            "Fill in the job description and click **Analyze Fit**, or use "
+            "**Try the 60-second demo** / **Load sample Product Operations JD** above."
         )
         return
 
@@ -832,39 +959,45 @@ def _component_table(component_scores):
     )
 
 
+def _render_fit_narrative_metrics(narrative):
+    """Numeric fit dimensions — shown after the primary recruiter-facing summary."""
+    m = st.columns(5)
+    cap_label = narrative.get("capability_fit_metric_label", xt.CAPABILITY_FIT_METRIC_LABEL)
+    cap_val = narrative.get("direct_capability_fit", narrative.get("direct_evidence_fit", 0))
+    m[0].metric(cap_label, f"{cap_val}")
+    m[1].metric("Transferability Fit", f"{narrative.get('transferability_fit', 0)}")
+    m[2].metric("Positioning Potential", f"{narrative.get('verbal_positioning_potential', 0)}")
+    risk = narrative.get("material_gap_risk", "—")
+    m[3].metric("Material Gap Risk", risk)
+    m[4].metric("Resume Competitiveness", f"{narrative.get('resume_competitiveness', 0)}")
+    if not narrative.get("has_literal_direct_evidence") and cap_val:
+        st.caption(
+            f"{cap_label} reflects verified functional capabilities (workflow, systems delivery, "
+            "stakeholder alignment) — not direct experience with this employer's specific "
+            "enterprise systems or domain."
+        )
+    if risk and risk != "—":
+        st.caption(
+            "Material Gap Risk reflects domain, systems, and technical gaps — "
+            "Low / Moderate / Significant / Major. Higher means more material gaps."
+        )
+    if narrative.get("show_positioning_cap_note"):
+        st.caption(xt.POSITIONING_CAPTION)
+
+
 def _render_fit_narrative(narrative):
     """Display fit dimensions (presentation only — does not change scoring)."""
     with st.container(border=True):
         st.markdown("**How your experience maps to this role**")
         st.caption(narrative.get("summary_text", ""))
-        m = st.columns(5)
-        cap_label = narrative.get("capability_fit_metric_label", xt.CAPABILITY_FIT_METRIC_LABEL)
-        cap_val = narrative.get("direct_capability_fit", narrative.get("direct_evidence_fit", 0))
-        m[0].metric(cap_label, f"{cap_val}")
-        m[1].metric("Transferability Fit", f"{narrative.get('transferability_fit', 0)}")
-        m[2].metric("Positioning Potential", f"{narrative.get('verbal_positioning_potential', 0)}")
-        risk = narrative.get("material_gap_risk", "—")
-        m[3].metric("Material Gap Risk", risk)
-        m[4].metric("Resume Competitiveness", f"{narrative.get('resume_competitiveness', 0)}")
-        if not narrative.get("has_literal_direct_evidence") and cap_val:
-            st.caption(
-                f"{cap_label} reflects verified functional capabilities (workflow, systems delivery, "
-                "stakeholder alignment) — not direct experience with this employer's specific "
-                "enterprise systems or domain."
-            )
-        if risk and risk != "—":
-            st.caption(
-                "Material Gap Risk reflects domain, systems, and technical gaps — "
-                "Low / Moderate / Significant / Major. Higher means more material gaps."
-            )
-        if narrative.get("show_positioning_cap_note"):
-            st.caption(xt.POSITIONING_CAPTION)
+        _render_fit_narrative_metrics(narrative)
 
 
-def _render_what_you_have(result, profile_text, fit_narrative=None):
+def _render_what_you_have(result, profile_text, fit_narrative=None, *, embedded=False):
     """Section A: domain evidence + transferable evidence + usable skills."""
     fn = fit_narrative or {}
-    st.subheader("A. What You Already Have")
+    if not embedded:
+        st.subheader("A. What You Already Have")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Direct domain evidence**")
@@ -1114,65 +1247,69 @@ def _render_analysis_results(profile_text, inputs, result):
     resolved = translation_analysis.get("resolved_role_family")
     if resolved:
         result["selected_role_family"] = resolved
-    if resolved == xt.BS_ROLE_FAMILY:
+    angle_override = (inputs.get("angle_override") or "").strip()
+    if resolved == xt.BS_ROLE_FAMILY and not angle_override:
         result["suggested_resume_angle"] = "Product Operations & Business Systems"
     role_family = result["selected_role_family"]
+    display_angle = angle_override or result["suggested_resume_angle"]
     st.session_state["analyze_translation_cards"] = translation_analysis["translation_cards"]
+    narrative = translation_analysis["fit_narrative"]
 
-    # ---- Stage 2: Decision Summary ---------------------------------------
+    # ---- Stage 2: Decision bucket ----------------------------------------
     st.subheader("2. Decision Summary")
-    decision, priority, adjusted_score, rf_adjustment = _decision_summary_card(
-        result, fit_narrative=translation_analysis["fit_narrative"],
+    decision, priority, adjusted_score, rf_adjustment, base_score = _decision_summary_card(
+        result, fit_narrative=narrative, display_angle=display_angle,
     )
-    _render_fit_narrative(translation_analysis["fit_narrative"])
 
-    # ---- Stage 3: Evidence mapping (A / B / C) -----------------------------
-    st.subheader("3. How Your Experience Maps")
+    # ---- Fit summary (text first — numeric detail deferred) ----------------
+    st.subheader("Fit summary")
+    summary_text = (narrative.get("summary_text") or "").strip()
+    if summary_text:
+        st.write(summary_text)
+    else:
+        st.caption("Review the decision summary above for the recommended next step.")
+
+    # ---- Strengths ---------------------------------------------------------
+    st.subheader("3. Strengths")
     _render_what_you_have(
-        result, profile_text, fit_narrative=translation_analysis["fit_narrative"],
+        result, profile_text, fit_narrative=narrative, embedded=True,
     )
-    with st.expander("B. What Needs Better Positioning", expanded=False):
-        cards = _render_positioning_section(
-            st.session_state["analyze_translation_cards"], embedded=True,
-        )
-    st.session_state["analyze_translation_cards"] = cards
-    with st.expander("C. True Gaps / Caution Flags", expanded=False):
-        _render_true_gaps(translation_analysis["gap_analysis"], embedded=True)
 
-    with st.expander("Component scores & recommended positioning", expanded=False):
-        st.dataframe(
-            _component_table(result["component_scores"]), width="stretch", hide_index=True
-        )
-        st.markdown("**Recommended resume positioning**")
-        st.markdown(result["recommended_positioning"])
+    # ---- Gaps --------------------------------------------------------------
+    st.subheader("4. Gaps & caution flags")
+    _render_true_gaps(translation_analysis["gap_analysis"], embedded=True)
 
-    # ---- Stage 4: Recommended Action -------------------------------------
-    st.subheader("4. Recommended Action")
-    primary_label, primary_target, primary_hint = translation_analysis["primary_action"]
+    # ---- Recommended Action (before detailed numeric scoring) --------------
+    st.subheader("5. Recommended Action")
+    _primary_label, _primary_target, primary_hint = translation_analysis["primary_action"]
     st.caption(primary_hint)
 
-    ac1, ac2, ac3 = st.columns([2, 1, 1])
+    ac1, ac2 = st.columns(2)
     with ac1:
-        if st.button(f"▶ {primary_label}", type="primary", width="stretch", key="aj_primary_action"):
-            if primary_target == "resume":
-                st.session_state["analyze_show_resume"] = True
-            elif primary_target == "strengthen":
-                st.session_state["analyze_focus_strengthen"] = True
-            else:
-                _save_job_to_tracker(inputs, result, decision, priority, base_score, role_family)
+        if st.button(
+            f"▶ {TAILORING_PLAN_ACTION}",
+            type="primary",
+            width="stretch",
+            key="aj_review_tailoring_plan",
+        ):
+            st.session_state["analyze_show_resume"] = True
     with ac2:
         if st.button("Save Job to Tracker", width="stretch", key="aj_save_secondary"):
             _save_job_to_tracker(inputs, result, decision, priority, base_score, role_family)
-    with ac3:
-        if st.button("Generate Resume", width="stretch", key="aj_gen_secondary"):
-            st.session_state["analyze_show_resume"] = True
 
-    # ---- Resume generation (verified material only) ----------------------
+    # ---- Tailored resume preview (verified material only) ------------------
     if st.session_state.get("analyze_show_resume"):
         with st.container(border=True):
-            angle = result["suggested_resume_angle"]
+            st.markdown(f"**{RESUME_PREVIEW_LABEL}**")
+            angle = display_angle
             cards_for_plan = st.session_state.get("analyze_translation_cards") or []
             plan = xt.build_tailoring_plan(result, cards_for_plan, angle=angle, jd_text=jd_text)
+            gap_analysis = translation_analysis["gap_analysis"]
+            boundaries = _portfolio_meaningful_boundary_lines(
+                plan.get("true_gaps_not_overstated") or [],
+                gap_analysis,
+                jd_text,
+            )
             st.markdown("**Tailoring Plan**")
             st.caption(f"Positioning angle: **{plan['positioning_angle']}**")
             if plan["top_evidence"]:
@@ -1183,8 +1320,10 @@ def _render_analysis_results(profile_text, inputs, result):
                 st.caption("JD themes to emphasize: " + ", ".join(plan["jd_themes"]))
             if plan["jd_language_to_mirror"]:
                 st.caption("JD language to mirror: " + ", ".join(plan["jd_language_to_mirror"]))
-            if plan["true_gaps_not_overstated"]:
-                st.caption("Will not overstate: " + "; ".join(plan["true_gaps_not_overstated"][:4]))
+            if boundaries:
+                for line in (_format_truth_boundary_display(b) for b in boundaries[:4]):
+                    if line:
+                        st.caption(line)
             job_row = {
                 "job_id": "analyze_" + (inputs.get("company", "") + "_" + inputs.get("job_title", "")).replace(" ", "_")[:40],
                 "company": inputs.get("company", ""),
@@ -1201,7 +1340,26 @@ def _render_analysis_results(profile_text, inputs, result):
                 translation_cards=cards_for_plan,
                 tailoring_plan=plan,
                 role_family=role_family,
+                collapse_match_diagnostics=True,
             )
+
+    # ---- Detailed numeric scoring (deferred for recruiter scan) ----------
+    with st.expander("Detailed fit scores & component breakdown", expanded=False):
+        _render_decision_summary_scores(
+            result, narrative, base_score, adjusted_score, rf_adjustment,
+        )
+        _render_fit_narrative_metrics(narrative)
+        st.dataframe(
+            _component_table(result["component_scores"]), width="stretch", hide_index=True,
+        )
+        st.markdown("**Recommended resume positioning**")
+        st.markdown(result["recommended_positioning"])
+
+    with st.expander("B. What Needs Better Positioning", expanded=False):
+        cards = _render_positioning_section(
+            st.session_state["analyze_translation_cards"], embedded=True,
+        )
+    st.session_state["analyze_translation_cards"] = cards
 
     # ---- Strengthen Your Case + calibration (collapsed for portfolio demo) --
     expand_strengthen = st.session_state.pop("analyze_focus_strengthen", False)
@@ -1480,7 +1638,8 @@ def page_candidate_profile():
             st.error(str(exc))
 
 
-def _render_match_result(result):
+def _render_match_result_diagnostics(result):
+    """Keyword/title diagnostics for preview matching (presentation only)."""
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Match Score", f"{result['match_score']}")
@@ -1498,9 +1657,16 @@ def _render_match_result(result):
         st.write("**Missing Keywords**")
         st.write(", ".join(result["missing_keywords"]) if result["missing_keywords"] else "_None_")
 
-    st.write("**Top Relevant Facts**")
-    for fact in result["top_relevant_facts"]:
-        st.markdown(f"- {fact}")
+
+def _render_match_result(result, *, collapse_diagnostics=False):
+    if collapse_diagnostics:
+        with st.expander("Preview matching details", expanded=False):
+            _render_match_result_diagnostics(result)
+    else:
+        _render_match_result_diagnostics(result)
+        st.write("**Top Relevant Facts**")
+        for fact in result["top_relevant_facts"]:
+            st.markdown(f"- {fact}")
 
 
 FEEDBACK_OPTIONS = [
@@ -1680,7 +1846,7 @@ def _render_resume_review(
 
     display_text = rr.rebuild_full_resume_text(resume_data, bullet_states)
     st.text_area(
-        "Generated Resume",
+        RESUME_PREVIEW_LABEL,
         value=display_text,
         height=400,
         key=f"resume_text_{job_id}",
@@ -1781,7 +1947,7 @@ def _render_resume_review(
 
 def _render_resume_section(profile_text, job_row, angle="", decision="", score=None,
                            job_analysis_id=None, translation_cards=None, tailoring_plan=None,
-                           role_family=""):
+                           role_family="", *, collapse_match_diagnostics=False):
     """Match the selected job, then generate / download / save a tailored resume.
 
     Resume state is keyed by job_id so switching jobs does not show stale output.
@@ -1797,9 +1963,10 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
         st.session_state[mr_key] = matching.match_job_to_candidate(profile_text, job_row)
     result = st.session_state[mr_key]
 
-    _render_match_result(result)
+    _render_match_result(result, collapse_diagnostics=collapse_match_diagnostics)
 
-    st.markdown("**Tailored Resume**")
+    if not collapse_match_diagnostics:
+        st.markdown(f"**{RESUME_PREVIEW_LABEL}**")
     st.caption(
         "Generated resumes use your verified master profile, selected Verified Evidence "
         "items, and approved translation mappings. Unverified / temporary evidence is "
@@ -1847,7 +2014,7 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
 
     colg1, colg2 = st.columns(2)
     with colg1:
-        gen_clicked = st.button("Generate Resume", key=f"gen_{job_id}", type="primary")
+        gen_clicked = st.button(RESUME_PREVIEW_ACTION, key=f"gen_{job_id}", type="primary")
     with colg2:
         regen_clicked = st.button("Regenerate with Feedback (new version)", key=f"regen_{job_id}")
 
@@ -1882,7 +2049,7 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
 
     resume_data = st.session_state.get(data_key)
     if not resume_data:
-        st.info("Click **Generate Resume** to build a tailored resume from this match.")
+        st.info(f"Click **{RESUME_PREVIEW_ACTION}** to build a preview from this match.")
         return
 
     bullet_states, display_text, saved_review = _render_resume_review(
@@ -2165,7 +2332,7 @@ def page_job_matching():
 
     # ---- 5. Tailored resume ----------------------------------------------
     st.divider()
-    st.subheader("5. Generate Tailored Resume")
+    st.subheader(f"5. {RESUME_PREVIEW_ACTION}")
     _render_resume_section(profile_text, job_row)
 
 
