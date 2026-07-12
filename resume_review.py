@@ -88,7 +88,15 @@ def rebuild_full_resume_text(resume_data, bullet_states):
     parts = [
         resume_data.get("header_name", ""),
         resume_data.get("target_title", ""),
-        f"{resume_data.get('header_location', '')} | {resume_data.get('header_email', '')} | {resume_data.get('header_phone', '')}",
+        " | ".join(
+            p.strip()
+            for p in (
+                resume_data.get("header_location", ""),
+                resume_data.get("header_email", ""),
+                resume_data.get("header_phone", ""),
+            )
+            if p and p.strip()
+        ),
         "",
         "PROFILE",
         resume_data.get("profile", ""),

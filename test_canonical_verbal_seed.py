@@ -36,7 +36,11 @@ def _identity_item(title, company, role_context, time_period, **extra):
         "company": company,
         "role_context": role_context,
         "time_period": time_period,
-        "factual_context": extra.get("factual_context", "Verified factual context for testing."),
+        "factual_context": extra.get(
+            "factual_context",
+            "Designed role-based access controls for an internal operations platform with "
+            "approval paths, lifecycle monitoring, and exception handling.",
+        ),
         "impact_outcome": extra.get("impact_outcome", "Measurable outcome."),
         "status": "Verified",
     }
@@ -266,8 +270,8 @@ def test_preferred_wording_used_in_resume_material():
     item = db.get_evidence_item(eid)
     material = app._evidence_to_material([item], role_family="Product Operations")
     check("preferred in material", preferred in material)
-    generic_mat = app._evidence_to_material([item], role_family="Unrelated Family")
-    check("still uses preferred without exact family", preferred in generic_mat)
+    generic_mat = app._evidence_to_material([item], role_family="Marketing Analytics")
+    check("unknown family does not reuse unrelated preferred", preferred not in generic_mat)
 
 
 def test_existing_records_readable():
