@@ -183,7 +183,21 @@ def _access_opener(facts_low):
 
 
 def _is_access_governance_evidence(facts_low):
-    return any(k in facts_low for k in ("access", "permission", "role-based", "governance", "provisioning"))
+    """True only for permission/access lifecycle evidence — not platform integration governance."""
+    strong_signals = (
+        "access govern", "permission govern", "role-based access", "role based access",
+        "access request", "access lifecycle", "elevated access", "permission change",
+        "permission-change", "access control", "access-request",
+    )
+    if any(k in facts_low for k in strong_signals):
+        return True
+    if "provisioning" in facts_low and any(
+        k in facts_low for k in ("access", "permission", "onboarding", "hire", "new-hire", "new hire")
+    ):
+        return True
+    if "permission" in facts_low and "govern" in facts_low:
+        return True
+    return False
 
 
 def _build_access_bullet(facts, impact):

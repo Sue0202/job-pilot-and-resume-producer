@@ -286,13 +286,56 @@ SENIORITY_PATTERNS = {
     "new grad": [r"new\s*grad", r"new\s*graduate", r"entry[- ]level"],
     "associate": [r"\bassociate\b"],
     "junior": [r"\bjunior\b", r"\bjr\.?\b"],
-    "senior": [r"\bsenior\b", r"\bsr\.?\b"],
-    "staff": [r"\bstaff\b"],
-    "principal": [r"\bprincipal\b"],
+    "senior": [
+        r"\bsenior director\b",
+        r"\bsenior manager\b",
+        r"\bsenior program\b",
+        r"\bsenior product\b",
+        r"\bsenior operations\b",
+        r"\bsenior engineer\b",
+        r"\bsenior machine learning engineer\b",
+        r"\bsenior analyst\b",
+        r"\bsenior lead\b",
+        r"\bsenior level\b",
+        r"\bsenior role\b",
+        r"\bsenior(?:ity)?(?: level)?(?: position)?(?: role)? required\b",
+        r"\bsr\.?\s+(?:director|manager|engineer|pm|program)\b",
+        r"\bsenior\b(?!\s+leadership\b)",
+    ],
+    "staff": [
+        r"\bstaff engineer\b",
+        r"\bstaff software engineer\b",
+        r"\bstaff program manager\b",
+        r"\bstaff product manager\b",
+        r"\bstaff tpm\b",
+        r"\bstaff level\b",
+        r"\bstaff role\b",
+        r"\bstaff position\b",
+        r"\bprincipal/staff\b",
+        r"\bstaff/principal\b",
+    ],
+    "principal": [r"\bprincipal\b(?!\s*/\s*staff)"],
     "lead": [r"\blead\b"],
     "manager": [r"\bmanager\b"],
     "director": [r"\bdirector\b", r"\bhead of\b", r"\bvp\b", r"\bvice president\b"],
 }
+
+# Phrases that mention senior/staff words without requiring that seniority level.
+SENIORITY_FALSE_POSITIVE_SCRUBS = [
+    r"chief[- ]of[- ]staff[- ]adjacent",
+    r"chief[- ]of[- ]staff",
+    r"cos[- ]adjacent",
+    r"reporting to (?:the )?chief of staff",
+    r"for senior leadership",
+    r"with senior leadership",
+    r"to senior leadership",
+    r"senior leadership team",
+    r"executive[- ]level decision support",
+    r"executive decision support",
+]
+
+# Hard cap applies at or above this explicit years requirement (candidate ~6 yrs ops).
+SENIORITY_YEARS_HARD_CAP_THRESHOLD = 8
 
 # Hard-risk patterns. dealbreaker=True caps the overall score toward Skip.
 RISK_PATTERNS = [
@@ -401,6 +444,14 @@ def _split_sections(jd_text):
     return {k: "\n".join(v) for k, v in sections.items()}
 
 
+def _scrub_seniority_false_positives(text_lower):
+    """Remove stakeholder/context phrases that are not seniority requirements."""
+    scrubbed = text_lower
+    for pattern in SENIORITY_FALSE_POSITIVE_SCRUBS:
+        scrubbed = re.sub(pattern, " ", scrubbed, flags=re.I)
+    return re.sub(r"\s+", " ", scrubbed)
+
+
 def _max_years_required(text_lower):
     years = [int(m) for m in re.findall(r"(\d{1,2})\s*\+?\s*(?:years|yrs)", text_lower)]
     return max(years) if years else 0
@@ -411,14 +462,29 @@ def _max_years_required(text_lower):
 # ---------------------------------------------------------------------------
 
 def _detect_seniority(text_lower):
+    scrubbed = _scrub_seniority_false_positives(text_lower)
     found = []
     for label, patterns in SENIORITY_PATTERNS.items():
-        if any(re.search(p, text_lower) for p in patterns):
+        if any(re.search(p, scrubbed) for p in patterns):
             found.append(label)
-    yrs = _max_years_required(text_lower)
+    yrs = _max_years_required(scrubbed)
     if yrs:
         found.append(f"{yrs}+ years")
     return found
+
+
+def has_explicit_senior_level_requirement(seniority_signals):
+    """True when JD explicitly requires Director/Staff/Principal-level or 8+ years."""
+    labels = set(seniority_signals or [])
+    if labels & {"director", "principal", "staff"}:
+        return True
+    yrs = _years_required(seniority_signals)
+    return yrs >= SENIORITY_YEARS_HARD_CAP_THRESHOLD
+
+
+def _seniority_overreach_cap(seniority_signals):
+    """Whether to apply the conservative seniority/years hard cap."""
+    return has_explicit_senior_level_requirement(seniority_signals)
 
 
 def _detect_risk_flags(text_lower):
@@ -882,8 +948,6 @@ def _evidence_gap_questions(parsed, matched_evidence, candidate_text):
 def _compute_caps(parsed, role_family, profile):
     """Return (cap_value or None, notes) applying conservative hard penalties."""
     flags = {f["flag"] for f in parsed["risk_flags"]}
-    seniority = set(parsed["seniority_signals"])
-    yrs = _years_required(parsed["seniority_signals"])
 
     caps = []
     notes = []
@@ -901,9 +965,7 @@ def _compute_caps(parsed, role_family, profile):
         caps.append(4.0)
         notes.append("hard domain requirement without verified evidence")
 
-    overreach = bool({"staff", "principal", "director"} & seniority)
-    if ({"senior", "lead"} & seniority) and yrs >= 8:
-        overreach = True
+    overreach = _seniority_overreach_cap(parsed["seniority_signals"])
     if overreach:
         caps.append(5.0)
         notes.append("seniority/years far above candidate experience")

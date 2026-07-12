@@ -17,8 +17,8 @@ import re
 HEADER = {
     "name": "YEYI SU",
     "location": "San Francisco, California, United States",
-    "email": "yyisu0202@gmail.com",
-    "phone": "6283064627",
+    "email": "portfolio.demo@example.com",
+    "phone": "(555) 555-0100",
 }
 
 # Role family -> profile angle + target title

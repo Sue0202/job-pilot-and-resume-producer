@@ -1,12 +1,7 @@
-"""JobPilot: AI Resume Tailoring and Application Tracker.
+"""JobPilot — Evidence-First AI Job Search Workflow.
 
-A Streamlit MVP that matches sample job postings against a candidate master
-profile, generates a tailored resume (rule-based), exports DOCX/TXT, and tracks
-generated versions and manual applications in SQLite.
-
-Run locally:
-    pip install -r requirements.txt
-    streamlit run app.py
+Streamlit app: analyze fit against verified evidence, tailor resumes conservatively,
+and track applications. Run locally: pip install -r requirements.txt && streamlit run app.py
 """
 
 import json
@@ -24,6 +19,7 @@ import evidence_edit_state as ees
 import evidence_verbal as ev
 import evidence_vocabulary as evocab
 import role_family_vocab as rfv
+import verbal_draft_state as vds
 import verbal_retrieval as vr
 import jd_analyzer
 import matching
@@ -34,6 +30,10 @@ import test_personas
 BASE_DIR = Path(__file__).parent
 PROFILE_PATH = BASE_DIR / "candidate_master_profile.md"
 README_PATH = BASE_DIR / "README.md"
+
+PRODUCT_TAGLINE = "Evidence-First AI Job Search Workflow"
+PORTFOLIO_DEMO_JOB_ID = "J001"
+PORTFOLIO_DEMO_SESSION_FLAG = "_portfolio_load_demo_jd"
 
 # Job dataset fallback order: processed full sample -> demo -> built-in sample.
 PROCESSED_SAMPLE_PATH = BASE_DIR / "data" / "processed" / "external_jobs_sample.csv"
@@ -170,6 +170,85 @@ def load_readme():
     return "# JobPilot\n\nREADME.md not found. See project documentation."
 
 
+@st.cache_data
+def _read_builtin_sample_jobs():
+    if not SAMPLE_JOBS_PATH.exists():
+        return pd.DataFrame(columns=JOB_COLUMNS)
+    return pd.read_csv(SAMPLE_JOBS_PATH, dtype=str).fillna("")
+
+
+def _compose_sample_jd_text(row):
+    """Build a readable JD block from a sample_jobs.csv row."""
+    parts = [(row.get("description") or "").strip()]
+    resp = (row.get("responsibilities") or "").strip()
+    qual = (row.get("qualifications") or "").strip()
+    if resp:
+        parts.append(f"\n\nResponsibilities:\n{resp}")
+    if qual:
+        parts.append(f"\n\nQualifications:\n{qual}")
+    return "".join(parts).strip()
+
+
+def _get_builtin_sample_job(job_id=PORTFOLIO_DEMO_JOB_ID):
+    df = _read_builtin_sample_jobs()
+    if df.empty or "job_id" not in df.columns:
+        return None
+    matches = df[df["job_id"] == job_id]
+    if matches.empty:
+        return None
+    return matches.iloc[0]
+
+
+def _apply_demo_job_to_session(job_id=PORTFOLIO_DEMO_JOB_ID):
+    """Prefill Analyze Job form fields from built-in sample_jobs.csv (presentation only)."""
+    row = _get_builtin_sample_job(job_id)
+    if row is None:
+        return False
+    st.session_state["aj_company"] = row.get("company", "")
+    st.session_state["aj_title"] = row.get("job_title", "")
+    st.session_state["aj_link"] = row.get("job_url", "")
+    st.session_state["aj_location"] = row.get("location", "")
+    st.session_state["aj_jd"] = _compose_sample_jd_text(row)
+    st.session_state["aj_notes"] = "Portfolio demo — sample Product Operations JD."
+    st.session_state["aj_source"] = "Other"
+    st.session_state["aj_angle"] = "Auto (recommended)"
+    st.session_state["aj_custom_angle"] = ""
+    for key in (
+        "analyze_result", "analyze_inputs", "analyze_analysis_id",
+        "analyze_show_resume", "analyze_reanalysis", "analyze_calibrated",
+        "analyze_translation_cards",
+    ):
+        st.session_state.pop(key, None)
+    return True
+
+
+def _render_portfolio_demo_strip(*, context="home"):
+    """Recruiter-facing 3-minute demo entry point."""
+    row = _get_builtin_sample_job(PORTFOLIO_DEMO_JOB_ID)
+    title = row.get("job_title", "Product Operations Intern") if row is not None else "Product Operations Intern"
+    company = row.get("company", "Aurora Interactive") if row is not None else "Aurora Interactive"
+    with st.container(border=True):
+        st.markdown("#### Try the core workflow in ~3 minutes")
+        st.caption(PRODUCT_TAGLINE)
+        st.markdown(
+            "1. **Load a sample job** (Product Operations) · "
+            "2. **Analyze Fit** against verified evidence · "
+            "3. **Generate a tailored resume** — no fabricated experience."
+        )
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.caption(f"Sample: **{title}** at **{company}** (`{PORTFOLIO_DEMO_JOB_ID}` from `sample_jobs.csv`).")
+        with c2:
+            label = "Load sample job & analyze" if context == "analyze" else "Start demo → Analyze Job"
+            if st.button(label, type="primary", width="stretch", key=f"portfolio_demo_{context}"):
+                _apply_demo_job_to_session(PORTFOLIO_DEMO_JOB_ID)
+                if context == "home":
+                    st.session_state[PORTFOLIO_DEMO_SESSION_FLAG] = True
+                    _go("Analyze Job")
+                else:
+                    st.rerun()
+
+
 # Dense embeddings are expensive; build once per dataset and cache the index as a
 # resource. Returns None if the dense backend is unavailable (graceful fallback).
 @st.cache_resource(show_spinner="Building dense embeddings (first time only)...")
@@ -295,7 +374,7 @@ def _sidebar_nav():
     """Render grouped, workflow-oriented navigation. Returns the selected page."""
     current = st.session_state.setdefault("nav_page", "Home")
     st.sidebar.markdown("### JobPilot")
-    st.sidebar.caption("Job Search Decision Support & Resume Tailoring")
+    st.sidebar.caption(PRODUCT_TAGLINE)
     st.sidebar.divider()
     for group_title, pages in NAV_GROUPS:
         st.sidebar.caption(group_title.upper())
@@ -501,16 +580,13 @@ def _activity_rows(rows, cols, limit=5):
 
 
 def page_home():
-    st.title("Job Search Workspace")
-    st.caption(
-        "Evaluate jobs, tailor credible resumes, and keep your application pipeline "
-        "organized."
-    )
+    st.title("JobPilot")
+    st.caption(PRODUCT_TAGLINE)
+    _render_portfolio_demo_strip(context="home")
     st.write(
-        "JobPilot evaluates fit conservatively, distinguishes **direct** evidence from "
-        "**transferable** evidence, never fabricates experience, and helps you decide "
-        "whether to apply **before** generating a resume — while preserving your version "
-        "and application history."
+        "Evaluate jobs against **verified evidence**, translate transferable experience "
+        "conservatively, and decide whether to apply **before** generating a resume — "
+        "without fabricating experience."
     )
 
     analyses = db.get_job_analyses()
@@ -623,11 +699,16 @@ def page_home():
 def page_analyze_job():
     st.header("Analyze Job")
     st.caption(
-        "Paste one job description, see how your verified experience maps, then translate "
-        "and tailor — or save to your tracker. Your master profile is never overwritten."
+        "Paste one job description, map **verified evidence** to the role, then tailor "
+        "or save — your master profile is never overwritten."
     )
 
+    if st.session_state.pop(PORTFOLIO_DEMO_SESSION_FLAG, False):
+        _apply_demo_job_to_session(PORTFOLIO_DEMO_JOB_ID)
+
     profile_text = load_profile_text()
+
+    _render_portfolio_demo_strip(context="analyze")
 
     # ---- Stage 1: Job Input ----------------------------------------------
     st.subheader("1. Job Input")
@@ -674,11 +755,15 @@ def page_analyze_job():
             st.session_state.pop("analyze_show_resume", None)
             st.session_state.pop("analyze_reanalysis", None)
             st.session_state.pop("analyze_calibrated", None)
+            st.session_state.pop("analyze_translation_cards", None)
 
     result = st.session_state.get("analyze_result")
     inputs = st.session_state.get("analyze_inputs", {})
     if not result:
-        st.info("Fill in the job description and click **Analyze Fit**.")
+        st.info(
+            "Fill in the job description and click **Analyze Fit**, or use **Load sample job "
+            "& analyze** above for a quick recruiter demo."
+        )
         return
 
     _render_analysis_results(profile_text, inputs, result)
@@ -821,9 +906,10 @@ def _render_what_you_have(result, profile_text, fit_narrative=None):
             st.caption("No JD-listed tools/skills directly verified — check positioning section.")
 
 
-def _render_positioning_section(cards):
+def _render_positioning_section(cards, *, embedded=False):
     """Section B: translation cards for transferable experience."""
-    st.subheader("B. What Needs Better Positioning")
+    if not embedded:
+        st.subheader("B. What Needs Better Positioning")
     st.caption(
         "These are **positioning opportunities**, not missing experience. Your underlying "
         "work is relevant — the goal is target-industry language."
@@ -838,12 +924,29 @@ def _render_positioning_section(cards):
     for i, card in enumerate(cards):
         with st.container(border=True):
             cap = card.get("capability_label") or card.get("match_label", "")
-            st.markdown(f"**{cap}**")
-            st.markdown(f"*Original context:* {card['original_context']}")
-            st.markdown(f"*Target-role interpretation:* {card['target_role_interpretation']}")
-            st.markdown(f"*Resume-ready phrasing:* {card['resume_ready_phrasing']}")
-            st.caption(f"**JD relevance:** {card['jd_relevance']}")
-            st.caption(f"Why valid: {card.get('why_valid', '')}")
+            if card.get("source") == "evidence_library":
+                title = card.get("evidence_title") or f"Evidence #{card.get('evidence_id', '')}"
+                st.markdown(f"**{title}**")
+                st.caption(f"Match classification: **{card.get('match_classification') or cap}**")
+                badge = card.get("source_badge") or "—"
+                rel = card.get("relationship_type") or ""
+                st.caption(
+                    f"**{badge}** · Retrieval role family: **{card.get('retrieval_role_family') or '—'}** · "
+                    f"Matched role family: **{card.get('role_family_used') or '—'}** · ({rel})"
+                )
+                st.markdown(f"*Resume-ready phrasing:* {card.get('resume_ready_phrasing') or '—'}")
+                trans = (card.get("target_role_interpretation") or "").strip()
+                if trans and trans != "No saved target-role translation for this role family.":
+                    st.markdown(f"*Target-role translation:* {trans}")
+                st.caption(f"**JD relevance:** {card['jd_relevance']}")
+                st.caption(f"Why valid: {card.get('why_valid', '')}")
+            else:
+                st.markdown(f"**{cap}**")
+                st.markdown(f"*Original context:* {card['original_context']}")
+                st.markdown(f"*Target-role interpretation:* {card['target_role_interpretation']}")
+                st.markdown(f"*Resume-ready phrasing:* {card['resume_ready_phrasing']}")
+                st.caption(f"**JD relevance:** {card['jd_relevance']}")
+                st.caption(f"Why valid: {card.get('why_valid', '')}")
             card["selected"] = st.checkbox(
                 "Include in tailoring plan",
                 value=card.get("selected", True),
@@ -852,9 +955,10 @@ def _render_positioning_section(cards):
     return cards
 
 
-def _render_true_gaps(gap_analysis):
+def _render_true_gaps(gap_analysis, *, embedded=False):
     """Section C: genuine gaps — not wording gaps."""
-    st.subheader("C. True Gaps / Caution Flags")
+    if not embedded:
+        st.subheader("C. True Gaps / Caution Flags")
     st.caption(
         "Hard requirements, domain/system gaps, and eligibility constraints — "
         "not simple wording differences."
@@ -1003,6 +1107,7 @@ def _render_analysis_results(profile_text, inputs, result):
     translation_analysis = xt.analyze_translation(
         profile_text, jd_text, result, evidence_items,
         target_angle=inputs.get("angle_override") or result.get("suggested_resume_angle", ""),
+        job_title=inputs.get("job_title", ""),
     )
     # Apply resolved role family / angle for business-systems JDs (display only).
     result = dict(result)
@@ -1012,7 +1117,7 @@ def _render_analysis_results(profile_text, inputs, result):
     if resolved == xt.BS_ROLE_FAMILY:
         result["suggested_resume_angle"] = "Product Operations & Business Systems"
     role_family = result["selected_role_family"]
-    st.session_state.setdefault("analyze_translation_cards", translation_analysis["translation_cards"])
+    st.session_state["analyze_translation_cards"] = translation_analysis["translation_cards"]
 
     # ---- Stage 2: Decision Summary ---------------------------------------
     st.subheader("2. Decision Summary")
@@ -1023,12 +1128,18 @@ def _render_analysis_results(profile_text, inputs, result):
 
     # ---- Stage 3: Evidence mapping (A / B / C) -----------------------------
     st.subheader("3. How Your Experience Maps")
-    _render_what_you_have(result, profile_text, fit_narrative=translation_analysis["fit_narrative"])
-    cards = _render_positioning_section(st.session_state["analyze_translation_cards"])
+    _render_what_you_have(
+        result, profile_text, fit_narrative=translation_analysis["fit_narrative"],
+    )
+    with st.expander("B. What Needs Better Positioning", expanded=False):
+        cards = _render_positioning_section(
+            st.session_state["analyze_translation_cards"], embedded=True,
+        )
     st.session_state["analyze_translation_cards"] = cards
-    _render_true_gaps(translation_analysis["gap_analysis"])
+    with st.expander("C. True Gaps / Caution Flags", expanded=False):
+        _render_true_gaps(translation_analysis["gap_analysis"], embedded=True)
 
-    with st.expander("Component scores & recommended positioning"):
+    with st.expander("Component scores & recommended positioning", expanded=False):
         st.dataframe(
             _component_table(result["component_scores"]), width="stretch", hide_index=True
         )
@@ -1089,56 +1200,56 @@ def _render_analysis_results(profile_text, inputs, result):
                 score=base_score, job_analysis_id=_persist_current_analysis(),
                 translation_cards=cards_for_plan,
                 tailoring_plan=plan,
+                role_family=role_family,
             )
 
-    # ---- Strengthen Your Case + calibration ------------------------------
-    st.subheader("Refine & Calibrate")
+    # ---- Strengthen Your Case + calibration (collapsed for portfolio demo) --
     expand_strengthen = st.session_state.pop("analyze_focus_strengthen", False)
-
-    with st.expander("Strengthen Your Case", expanded=expand_strengthen):
-        _render_strengthen_your_case(
-            profile_text, inputs, result, base_score, translation_analysis,
-        )
-
-    with st.expander("Score Calibration Feedback"):
-        st.caption(
-            "Records your opinion and a calibrated score. The base score is never overwritten."
-        )
-        with st.form("score_feedback_form"):
-            fb_label = st.radio(
-                "Do you agree with this score?",
-                ["About right", "Too low", "Too high"], horizontal=True,
+    with st.expander("Refine & Calibrate (optional)", expanded=expand_strengthen):
+        with st.expander("Strengthen Your Case", expanded=False):
+            _render_strengthen_your_case(
+                profile_text, inputs, result, base_score, translation_analysis,
             )
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                mag_label = st.selectbox("How much should the score change?", list(CALIBRATION_MAGNITUDES))
-            with cc2:
-                fb_reason = st.selectbox("Reason", SCORE_FEEDBACK_REASONS)
-            fb_notes = st.text_input("Notes (optional)")
-            if st.form_submit_button("Save Score Feedback"):
-                magnitude = CALIBRATION_MAGNITUDES[mag_label]
-                sign = {"About right": 0, "Too low": 1, "Too high": -1}[fb_label]
-                signed_adjustment = sign * magnitude
-                calibrated = jd_analyzer.apply_calibration(base_score, signed_adjustment)
-                analysis_id = _persist_current_analysis()
-                db.save_score_feedback(
-                    job_analysis_id=analysis_id,
-                    feedback_label=fb_label,
-                    reason=fb_reason,
-                    notes=fb_notes,
-                    base_score=base_score,
-                    adjustment_magnitude=signed_adjustment,
-                    calibrated_score=calibrated,
-                    role_family=role_family,
+
+        with st.expander("Score Calibration Feedback", expanded=False):
+            st.caption(
+                "Records your opinion and a calibrated score. The base score is never overwritten."
+            )
+            with st.form("score_feedback_form"):
+                fb_label = st.radio(
+                    "Do you agree with this score?",
+                    ["About right", "Too low", "Too high"], horizontal=True,
                 )
-                st.session_state["analyze_calibrated"] = (base_score, calibrated)
-                st.success(
-                    f"Saved. Base Score {base_score} -> Calibrated Score {calibrated} "
-                    f"(adjustment {signed_adjustment:+}). Base score unchanged."
-                )
-        if st.session_state.get("analyze_calibrated"):
-            b, c = st.session_state["analyze_calibrated"]
-            st.caption(f"Most recent calibration — Base: {b} | Calibrated: {c}")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    mag_label = st.selectbox("How much should the score change?", list(CALIBRATION_MAGNITUDES))
+                with cc2:
+                    fb_reason = st.selectbox("Reason", SCORE_FEEDBACK_REASONS)
+                fb_notes = st.text_input("Notes (optional)")
+                if st.form_submit_button("Save Score Feedback"):
+                    magnitude = CALIBRATION_MAGNITUDES[mag_label]
+                    sign = {"About right": 0, "Too low": 1, "Too high": -1}[fb_label]
+                    signed_adjustment = sign * magnitude
+                    calibrated = jd_analyzer.apply_calibration(base_score, signed_adjustment)
+                    analysis_id = _persist_current_analysis()
+                    db.save_score_feedback(
+                        job_analysis_id=analysis_id,
+                        feedback_label=fb_label,
+                        reason=fb_reason,
+                        notes=fb_notes,
+                        base_score=base_score,
+                        adjustment_magnitude=signed_adjustment,
+                        calibrated_score=calibrated,
+                        role_family=role_family,
+                    )
+                    st.session_state["analyze_calibrated"] = (base_score, calibrated)
+                    st.success(
+                        f"Saved. Base Score {base_score} -> Calibrated Score {calibrated} "
+                        f"(adjustment {signed_adjustment:+}). Base score unchanged."
+                    )
+            if st.session_state.get("analyze_calibrated"):
+                b, c = st.session_state["analyze_calibrated"]
+                st.caption(f"Most recent calibration — Base: {b} | Calibrated: {c}")
 
 
 def _save_job_to_tracker(inputs, result, decision, priority, base_score, role_family):
@@ -1669,7 +1780,8 @@ def _render_resume_review(
 
 
 def _render_resume_section(profile_text, job_row, angle="", decision="", score=None,
-                           job_analysis_id=None, translation_cards=None, tailoring_plan=None):
+                           job_analysis_id=None, translation_cards=None, tailoring_plan=None,
+                           role_family=""):
     """Match the selected job, then generate / download / save a tailored resume.
 
     Resume state is keyed by job_id so switching jobs does not show stale output.
@@ -1695,7 +1807,7 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
     )
 
     # ---- Verified evidence selection -------------------------------------
-    verified = db.get_verified_evidence()
+    verified = vr.filter_tailoring_evidence(db.get_verified_evidence())
     chosen_ev = []
     if verified:
         labels = {f"#{e['id']} {e.get('title') or e.get('company') or 'evidence'}": e for e in verified}
@@ -1742,9 +1854,12 @@ def _render_resume_section(profile_text, job_row, angle="", decision="", score=N
     data_key = f"resume_data_{job_id}"
     fb_key = f"resume_feedback_{job_id}"
     if gen_clicked or regen_clicked:
-        # Combine verified profile + evidence + approved translations (never temp evidence).
-        material = profile_text + _evidence_to_material(chosen_ev, role_family=angle or "")
+        rf = role_family or result.get("selected_role_family") or angle or ""
+        jd_snippet = job_row.get("description") or ""
+        built = vr.build_evidence_material(chosen_ev, role_family=rf, jd_snippet=jd_snippet)
+        material = profile_text + (built.get("material") or "")
         material += xt.approved_mappings_to_material(approved_cards)
+        st.session_state[f"resume_verbal_audit_{job_id}"] = built.get("retrievals") or []
         fb_parts = list(fb_presets)
         if angle:
             fb_parts.append(f"angle: {angle}")
@@ -2341,13 +2456,15 @@ def _render_verbal_outputs_section(
     )
     if new_rf.strip():
         role_family = rfv.ensure_role_family(new_rf.strip())
-    rf_norm = rfv.normalize_role_family_key(role_family)
 
     output_type = st.selectbox(
         "Output type",
         [ev.OUTPUT_RESUME_BULLET, ev.OUTPUT_TARGET_TRANSLATION],
         format_func=ev.verbal_output_label,
         key=f"verbal_otype_{item_id}",
+    )
+    draft_key, draft_widget_key, rf_norm, output_type = vds.prepare_verbal_draft_ui(
+        st.session_state, item_id, role_family, output_type,
     )
 
     saved_for_role = db.get_verbal_outputs_for_role(item_id, role_family, rf_norm)
@@ -2367,9 +2484,11 @@ def _render_verbal_outputs_section(
                 if st.button("Edit in draft", key=f"edit_vo_{out['id']}"):
                     otype = out.get("output_type") or ev.OUTPUT_RESUME_BULLET
                     st.session_state[f"verbal_otype_{item_id}"] = otype
-                    st.session_state[
-                        f"verbal_draft_{item_id}_{rf_norm}_{otype}"
-                    ] = out.get("generated_text") or ""
+                    out_rf_norm = rfv.normalize_role_family_key(out.get("role_family") or role_family)
+                    vds.set_verbal_draft(
+                        st.session_state, item_id, out_rf_norm, otype,
+                        out.get("generated_text") or "",
+                    )
                     _flash_evidence("Loaded into draft — edit and Save wording to replace.")
             with c2:
                 if st.button("Mark preferred", key=f"pref_{out['id']}"):
@@ -2382,10 +2501,6 @@ def _render_verbal_outputs_section(
                 if st.button("Delete", key=f"del_vo_{out['id']}"):
                     db.delete_verbal_output(out["id"])
                     _flash_evidence("Deleted saved wording.")
-
-    draft_key = f"verbal_draft_{item_id}_{rf_norm}_{output_type}"
-    if draft_key not in st.session_state:
-        st.session_state[draft_key] = ""
 
     fb_tags = st.multiselect(
         "Feedback tags (optional)",
@@ -2410,7 +2525,7 @@ def _render_verbal_outputs_section(
             if err:
                 st.session_state[f"verbal_err_{item_id}"] = err
             else:
-                st.session_state[draft_key] = text
+                vds.set_verbal_draft(st.session_state, item_id, rf_norm, output_type, text)
                 st.session_state.pop(f"verbal_err_{item_id}", None)
     with g2:
         st.caption("New drafts stay transient until you explicitly save.")
@@ -2421,7 +2536,7 @@ def _render_verbal_outputs_section(
     st.text_area(
         f"New generated draft — {ev.verbal_output_label(output_type)}",
         height=100,
-        key=draft_key,
+        key=draft_widget_key,
     )
 
     tag_str = ", ".join(fb_tags + ([fb_custom.strip()] if fb_custom.strip() else []))
@@ -2431,7 +2546,7 @@ def _render_verbal_outputs_section(
         if st.button("Save wording", key=f"save_wording_{item_id}", use_container_width=True):
             db.upsert_verbal_output(
                 item_id, output_type,
-                st.session_state.get(draft_key, ""),
+                st.session_state.get(draft_widget_key, ""),
                 role_family=role_family,
                 role_family_normalized=rf_norm,
                 source="user_saved",
@@ -2443,7 +2558,7 @@ def _render_verbal_outputs_section(
         if st.button("Mark approved", key=f"mark_verbal_{item_id}", use_container_width=True):
             db.upsert_verbal_output(
                 item_id, output_type,
-                st.session_state.get(draft_key, ""),
+                st.session_state.get(draft_widget_key, ""),
                 role_family=role_family,
                 role_family_normalized=rf_norm,
                 user_approved=True,
@@ -2458,7 +2573,7 @@ def _render_verbal_outputs_section(
                 db.update_verbal_output(other["id"], {"is_preferred": False})
             db.upsert_verbal_output(
                 item_id, output_type,
-                st.session_state.get(draft_key, ""),
+                st.session_state.get(draft_widget_key, ""),
                 role_family=role_family,
                 role_family_normalized=rf_norm,
                 user_approved=True,
@@ -2470,27 +2585,10 @@ def _render_verbal_outputs_section(
             _flash_evidence("Saved as preferred wording for this evidence + role family.")
 
 
-def _evidence_to_material(items, role_family=""):
+def _evidence_to_material(items, role_family="", jd_snippet=""):
     """Render verified evidence items as resume-ready text appended to the profile."""
-    if not items:
-        return ""
-    lines = ["\n\n## Verified Evidence Library (approved by candidate)\n"]
-    for e in items:
-        bullet = vr.preferred_resume_bullet(e, role_family=role_family)
-        if not bullet:
-            bullet = (e.get("bullet_draft") or "").strip()
-        if not bullet:
-            bullet, _ = ev.generate_resume_bullet(
-                _evidence_factual(e), _evidence_impact(e),
-                e.get("company", ""), e.get("role_context", ""), e.get("skills", ""),
-                [t.strip() for t in (e.get("capability_tags") or e.get("tags") or "").split(",") if t.strip()],
-                role_family=role_family,
-            )
-        if not bullet:
-            bullet = e.get("title", "") or ""
-        context = " ".join(p for p in [e.get("company", ""), e.get("role_context", "")] if p)
-        lines.append(f"- {bullet}" + (f" ({context})" if context else ""))
-    return "\n".join(lines)
+    built = vr.build_evidence_material(items, role_family=role_family, jd_snippet=jd_snippet)
+    return built.get("material") or ""
 
 
 def page_evidence_library():
@@ -2658,6 +2756,7 @@ def page_evidence_library():
     st.subheader("Review / edit item")
     ids = [e["id"] for e in items]
     sel = st.selectbox("Select evidence id", options=ids, key="ev_review_sel")
+    vds.on_evidence_selection_changed(st.session_state, sel)
     item = db.get_evidence_item(sel)
     if item:
         ees.apply_evidence_edit_reload(st.session_state, sel)
@@ -3200,7 +3299,7 @@ PAGE_DISPATCH = {
 
 def main():
     st.set_page_config(
-        page_title="JobPilot — Job Search Decision Support",
+        page_title="JobPilot — Evidence-First Job Search",
         page_icon="🧭",
         layout="wide",
     )

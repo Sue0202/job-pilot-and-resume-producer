@@ -453,6 +453,7 @@ BUSINESS_SYSTEMS_JD_SIGNALS = [
 
 BS_ROLE_FAMILY = "Business Systems / Internal Tools / Enterprise Operations Systems"
 
+import role_family_resolver as rfrs
 # User-facing capability labels (Part 3 — never imply direct enterprise-system ownership).
 CAPABILITY_FIT_METRIC_LABEL = "Direct Capability Fit"
 POSITIONING_CAPTION = (
@@ -477,15 +478,16 @@ ENTERPRISE_DOMAIN_PROFILE_SIGNALS = [
 ]
 
 
-def resolve_role_family(jd_text, result):
-    """Display role family — prefer Business Systems over generic CX/Workflow."""
+def resolve_role_family(jd_text, result, job_title=""):
+    """Retrieval role family — does not change jd_analyzer scoring role family."""
     jd_low = _norm(jd_text)
-    current = result.get("selected_role_family", "")
     if _has_any(jd_low, BUSINESS_SYSTEMS_JD_SIGNALS):
         return BS_ROLE_FAMILY
-    if current == "Workflow / CX Operations" and _has_any(jd_low, BUSINESS_SYSTEMS_JD_SIGNALS):
-        return BS_ROLE_FAMILY
-    return current
+    return rfrs.resolve_retrieval_role_family(
+        jd_text,
+        job_title=job_title,
+        scoring_role_family=result.get("selected_role_family", ""),
+    )
 
 
 def is_business_systems_jd(jd_text):
@@ -534,7 +536,9 @@ def _relevant_jd_themes(jd_text, themes):
 
 def build_translation_cards(profile_text, jd_text, result, evidence_items=None):
     """Return positioning cards for verified experience that maps to this JD."""
-    evidence_items = evidence_items or []
+    import verbal_retrieval as vr
+
+    evidence_items = vr.filter_tailoring_evidence(evidence_items or [])
     role_family = result.get("selected_role_family", "")
     cards = []
     seen_ids = set()
@@ -565,34 +569,50 @@ def build_translation_cards(profile_text, jd_text, result, evidence_items=None):
             "source": "profile",
         })
 
-    # Evidence library items with stored translations.
+    seen_evidence_ids = set()
     for item in evidence_items:
-        facts = (item.get("factual_context") or item.get("action") or item.get("title") or "").strip()
-        bullet = (item.get("bullet_draft") or facts).strip()
-        if not bullet:
+        eid = item.get("id")
+        if eid in seen_evidence_ids:
             continue
-        translations = (item.get("target_role_translations") or "").strip()
-        original = facts or (item.get("original_industry_context") or item.get("role_context") or "").strip()
+        seen_evidence_ids.add(eid)
+
+        pair = vr.retrieve_evidence_pair(item, role_family=role_family, jd_snippet=jd_text)
+        bullet = pair["resume_bullet"]
+        translation = pair["target_translation"]
+        bullet["source_badge"] = vr.source_badge_label(bullet)
+
+        facts = (
+            (item.get("factual_context") or item.get("action") or "").strip()
+        )
         tags = [t.strip() for t in (item.get("capability_tags") or item.get("tags") or "").split(",") if t.strip()]
         strength = item.get("proof_strength") or "Transferable"
         cap_label = CAPABILITY_DIRECT if strength == "Direct" else CAPABILITY_TRANSFERABLE
+
+        trans_text = (translation.get("selected_verbal_text") or "").strip()
         cards.append({
-            "mapping_id": f"evidence_{item.get('id')}",
-            "original_context": original or bullet,
-            "target_role_interpretation": translations or "Recorded evidence item",
-            "resume_ready_phrasing": bullet,
-            "jd_relevance": "From Evidence Library",
+            "mapping_id": f"evidence_{eid}",
+            "evidence_id": eid,
+            "evidence_title": item.get("title") or "",
+            "original_context": facts[:240] + ("…" if len(facts) > 240 else ""),
+            "target_role_interpretation": trans_text or "No saved target-role translation for this role family.",
+            "resume_ready_phrasing": bullet.get("selected_verbal_text") or "",
+            "jd_relevance": "Verified Evidence Library",
             "match_label": cap_label,
+            "match_classification": cap_label,
             "capability_label": cap_label,
             "proof_strength": strength,
             "capability_tags": tags,
-            "why_valid": "Verified evidence library item approved by candidate.",
-            "selected": item.get("status") == "Verified",
+            "why_valid": "Verified evidence library item with role-family verbal retrieval.",
+            "selected": True,
             "source": "evidence_library",
-            "evidence_id": item.get("id"),
+            "retrieval_role_family": bullet.get("selected_role_family") or role_family,
+            "role_family_used": bullet.get("matched_role_family") or role_family,
+            "wording_source": bullet.get("wording_source"),
+            "relationship_type": bullet.get("relationship_type"),
+            "source_badge": bullet.get("source_badge"),
+            "verbal_retrieval": pair,
         })
 
-    # Sort: Direct first, then Transferable, then Positioning opportunity.
     cards.sort(key=lambda c: CAPABILITY_SORT_ORDER.get(c.get("capability_label", c["match_label"]), 4))
     return cards
 
@@ -794,9 +814,9 @@ def classify_gaps(jd_text, profile_text, result):
                 "has_adjacent_workflow": has_adjacent,
             })
 
-    # Seniority check (conservative).
+    # Seniority check (conservative) — only explicit Director/Staff/Principal or 8+ years.
     seniority = parsed.get("seniority_signals") or []
-    if any(s in seniority for s in ("director", "principal", "staff")):
+    if jd_analyzer and jd_analyzer.has_explicit_senior_level_requirement(seniority):
         seniority_mismatch.append(
             "Seniority signal: role may expect Director/Staff/Principal level — verify scope fit."
         )
@@ -965,11 +985,10 @@ def recommend_primary_action(result, fit_narrative, gap_analysis):
     )
 
 
-def analyze_translation(profile_text, jd_text, result, evidence_items=None, target_angle=""):
+def analyze_translation(profile_text, jd_text, result, evidence_items=None, target_angle="", job_title=""):
     """Full translation analysis for Analyze Job results."""
     evidence_items = evidence_items or []
-    # Resolve display role family for business-systems JDs.
-    resolved_family = resolve_role_family(jd_text, result)
+    resolved_family = resolve_role_family(jd_text, result, job_title=job_title)
     result = dict(result)
     result["selected_role_family"] = resolved_family
     if resolved_family == BS_ROLE_FAMILY:
