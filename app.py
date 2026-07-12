@@ -993,6 +993,43 @@ def _render_fit_narrative(narrative):
         _render_fit_narrative_metrics(narrative)
 
 
+def _normalize_skill_token(value):
+    """Case-insensitive skill/tool token for cross-section comparison."""
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _usable_jd_skills(result, profile_text):
+    """JD-listed skills/tools verified against profile or candidate skill set."""
+    parsed = result.get("parsed") or {}
+    prof_low = (profile_text or "").lower()
+    usable = []
+    seen = set()
+    for s in (parsed.get("required_skills") or []) + (parsed.get("preferred_skills") or []):
+        key = _normalize_skill_token(s)
+        if not key or key in seen:
+            continue
+        if key in jd_analyzer.CANDIDATE_SKILLS or key in prof_low:
+            seen.add(key)
+            usable.append(s)
+    return usable
+
+
+def _learnable_gap_skill_token(gap_line):
+    text = (gap_line or "").strip()
+    if ":" in text:
+        text = text.split(":", 1)[1].strip()
+    return _normalize_skill_token(text)
+
+
+def _filter_learnable_gaps(gap_analysis, result, profile_text):
+    """Drop learnable gaps that already appear under existing usable skills."""
+    existing = {_normalize_skill_token(s) for s in _usable_jd_skills(result, profile_text)}
+    return [
+        g for g in (gap_analysis.get("potentially_learnable_gaps") or [])
+        if _learnable_gap_skill_token(g) not in existing
+    ]
+
+
 def _render_what_you_have(result, profile_text, fit_narrative=None, *, embedded=False):
     """Section A: domain evidence + transferable evidence + usable skills."""
     fn = fit_narrative or {}
@@ -1027,14 +1064,9 @@ def _render_what_you_have(result, profile_text, fit_narrative=None, *, embedded=
             st.caption("No adjacent evidence flagged.")
     with col2:
         st.markdown("**Existing skills & tools usable for this role**")
-        parsed = result.get("parsed") or {}
-        prof_low = (profile_text or "").lower()
-        usable = []
-        for s in (parsed.get("required_skills") or []) + (parsed.get("preferred_skills") or []):
-            if s.lower() in jd_analyzer.CANDIDATE_SKILLS or s.lower() in prof_low:
-                usable.append(s)
+        usable = _usable_jd_skills(result, profile_text)
         if usable:
-            st.write(", ".join(sorted(set(usable))[:12]))
+            st.write(", ".join(sorted(usable, key=str.lower)[:12]))
         else:
             st.caption("No JD-listed tools/skills directly verified — check positioning section.")
 
@@ -1088,7 +1120,7 @@ def _render_positioning_section(cards, *, embedded=False):
     return cards
 
 
-def _render_true_gaps(gap_analysis, *, embedded=False):
+def _render_true_gaps(gap_analysis, *, embedded=False, result=None, profile_text=""):
     """Section C: genuine gaps — not wording gaps."""
     if not embedded:
         st.subheader("C. True Gaps / Caution Flags")
@@ -1134,10 +1166,14 @@ def _render_true_gaps(gap_analysis, *, embedded=False):
             else:
                 st.markdown(f"- :red[{g['tool']}] — no evidence of comparable workflow")
                 st.caption(g.get("note", ""))
-    if gap_analysis.get("potentially_learnable_gaps"):
+    learnable_gaps = (
+        _filter_learnable_gaps(gap_analysis, result, profile_text)
+        if result is not None else (gap_analysis.get("potentially_learnable_gaps") or [])
+    )
+    if learnable_gaps:
         has_any = True
         st.markdown("**Potentially learnable gaps**")
-        for g in gap_analysis["potentially_learnable_gaps"]:
+        for g in learnable_gaps:
             st.markdown(f"- {g}")
     if not has_any:
         st.caption("No material true gaps detected — focus on positioning and translation.")
@@ -1277,7 +1313,12 @@ def _render_analysis_results(profile_text, inputs, result):
 
     # ---- Gaps --------------------------------------------------------------
     st.subheader("4. Gaps & caution flags")
-    _render_true_gaps(translation_analysis["gap_analysis"], embedded=True)
+    _render_true_gaps(
+        translation_analysis["gap_analysis"],
+        embedded=True,
+        result=result,
+        profile_text=profile_text,
+    )
 
     # ---- Recommended Action (before detailed numeric scoring) --------------
     st.subheader("5. Recommended Action")
@@ -2400,7 +2441,7 @@ def page_generated_versions():
                 "company": v.get("company", ""),
                 "job_title": v.get("job_title", ""),
                 "angle": v.get("target_title", ""),
-                "fit_score": v.get("match_score", 0.0),
+                "Match score (0–100)": v.get("match_score", 0.0),
                 "feedback_used": "Yes" if (v.get("feedback_text") or "").strip() else "—",
             }
             for v in filtered
@@ -2421,7 +2462,7 @@ def page_generated_versions():
     with st.container(border=True):
         st.markdown(f"**{version['company']} — {version['job_title']}**")
         st.caption(
-            f"Angle: {version['target_title']} · Fit score: {version['match_score']} · "
+            f"Angle: {version['target_title']} · Match score (0–100): {version['match_score']} · "
             f"Created: {version['created_at']}"
         )
         st.caption("✓ Generated from verified candidate evidence only.")
@@ -3145,6 +3186,8 @@ def page_application_tracker():
             display_cols = ["id", "company", "job_title", "status", "role_family",
                             "analysis_score", "application_date", "job_url", "created_at"]
             df = df[[c for c in display_cols if c in df.columns]]
+            if "analysis_score" in df.columns:
+                df = df.rename(columns={"analysis_score": "Analysis score (0–10)"})
             st.dataframe(df, width="stretch", hide_index=True)
 
         # --- Detail panel + status update ---------------------------------
@@ -3158,7 +3201,10 @@ def page_application_tracker():
                 dc1, dc2, dc3 = st.columns(3)
                 dc1.metric("Status", current.get("status") or "—")
                 score = current.get("analysis_score")
-                dc2.metric("Fit score", f"{score}" if score not in (None, "") else "—")
+                dc2.metric(
+                    "Analysis score (0–10)",
+                    f"{score}" if score not in (None, "") else "—",
+                )
                 dc3.metric("Role family", current.get("role_family") or "—")
                 meta_bits = []
                 if current.get("source"):
